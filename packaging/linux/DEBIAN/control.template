@@ -1,0 +1,9 @@
+Package: shadowtalk
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: @ARCH@
+Maintainer: gene <gene@local>
+Depends: libc6, libgl1, libegl1, libx11-6, libxcb1, libxkbcommon0, libfontconfig1, libglib2.0-0, libdbus-1-3, libxext6, libxrender1
+Description: ShadowTalk 影聊 — 本机优先的 AI 桌面聊天
+ 自带 Python/Qt 运行时与 AI 工具写沙箱；数据保存在 ~/.shadowtalk。

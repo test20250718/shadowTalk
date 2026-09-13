@@ -1,0 +1,16 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# PyInstaller 构建产物
+build/
+dist/
+
+# 运行时数据（开发模式下生成于仓库根；禁止提交任何用户数据）
+data/
+logs/
+shadowtalk.db
+mail_attachments/
+todo.txt

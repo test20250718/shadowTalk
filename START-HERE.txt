@@ -1,0 +1,9 @@
+ShadowTalk - how to start developing on this PC
+
+  python -m venv venv
+  venv\Scripts\pip install -r requirements.txt
+  venv\Scripts\python -m pytest tests -q --ignore=tests/test_main_window.py
+  venv\Scripts\python shadowtalk\main.py
+
+Windows exe build:  build_exe.bat
+Linux deb build :  build_deb.sh (on Linux)

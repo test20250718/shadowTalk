@@ -1,0 +1,198 @@
+diff --git a/aiworkspace18/shadowtalk/core/english_exercise.py b/aiworkspace18/shadowtalk/core/english_exercise.py
+index e84592f..dfa87e3 100644
+--- a/aiworkspace18/shadowtalk/core/english_exercise.py
++++ b/aiworkspace18/shadowtalk/core/english_exercise.py
+@@ -220,10 +220,56 @@ def get_stats(friend_id):
+         correct_count = sum(1 for r in rows if r["correct"])
+         accuracy = round(correct_count * 100.0 / len(rows), 1)
+     else:
+         accuracy = 0.0
+ 
+     return {
+         "streak": streak,
+         "today_count": today_count,
+         "accuracy": accuracy,
+     }
++
++
++# ── 场景 prompt 构建 ──
++
++_SCENE_PROMPT_TEMPLATE = """你是一位专业的英语一对一教师，正在使用 {word_range} 词库辅导学生。
++
++当前进度：已掌握 {mastered} 词，学习中 {learning} 词，待复习 {review_due} 词。
++
++教学原则：
++- 系统性：按词库范围有计划地推进，确保覆盖核心词汇
++- 间隔重复：根据答题记录，错过的词在 1/3/7 轮后重现
++- 难度递进：先词义辨识，再填空，再组句，最后翻译拼装
++- 自由对话是语境补充：从上下文了解学生兴趣和表达水平
++- 用 present_exercise 工具出题，等学生答题后再讲解
++- 讲解简洁有力，1-3 句话
++- 偶尔可以超纲出 1-2 道拓展题（标注为 bonus），但不影响进度统计"""
++
++
++def build_scene_prompt(friend_id: int, word_range: str) -> str:
++    """构建带词库范围和当前统计的场景 prompt。
++
++    查询 english_progress 表统计已掌握 / 学习中 / 待复习的词数，
++    注入到场景模板中，让 AI 始终知道自己教到哪了。
++    """
++    conn = Database.get_connection()
++    mastered = conn.execute(
++        "SELECT COUNT(*) FROM english_progress "
++        "WHERE friend_id=? AND word_range=? AND status='mastered'",
++        (friend_id, word_range)).fetchone()[0]
++    learning = conn.execute(
++        "SELECT COUNT(*) FROM english_progress "
++        "WHERE friend_id=? AND word_range=? AND status='learning'",
++        (friend_id, word_range)).fetchone()[0]
++    now = datetime.datetime.now().isoformat()
++    review_due = conn.execute(
++        "SELECT COUNT(*) FROM english_progress "
++        "WHERE friend_id=? AND word_range=? AND review_at IS NOT NULL "
++        "AND review_at <= ?",
++        (friend_id, word_range, now)).fetchone()[0]
++
++    return _SCENE_PROMPT_TEMPLATE.format(
++        word_range=word_range,
++        mastered=mastered,
++        learning=learning,
++        review_due=review_due,
++    )
+diff --git a/aiworkspace18/shadowtalk/ui/widgets/english_room.py b/aiworkspace18/shadowtalk/ui/widgets/english_room.py
+index 65e1e0a..24a013e 100644
+--- a/aiworkspace18/shadowtalk/ui/widgets/english_room.py
++++ b/aiworkspace18/shadowtalk/ui/widgets/english_room.py
+@@ -655,15 +655,20 @@ class EnglishRoomWindow(RoomWindow):
+             feedback.setStyleSheet(
+                 "color: #2E9E57; font-size: 13px; padding: 8px;"
+                 " background: transparent;")
+         else:
+             feedback.setText(f"❌ 错误。正确答案：{correct_answer}\n{explanation}")
+             feedback.setStyleSheet(
+                 "color: #D9534F; font-size: 13px; padding: 8px;"
+                 " background: transparent;")
+         card._layout.addWidget(feedback)
+ 
++    def _current_scene_prompt(self) -> str:
++        """覆盖父类：注入当前词库范围 + 实时进度统计的场景 prompt"""
++        from shadowtalk.core.english_exercise import build_scene_prompt
++        return build_scene_prompt(self.friend_id, self._word_range)
++
+     def closeEvent(self, event):
+         if self._current_card is not None:
+             self._current_card.deleteLater()
+             self._current_card = None
+         super().closeEvent(event)
+diff --git a/aiworkspace18/tests/test_english_exercise.py b/aiworkspace18/tests/test_english_exercise.py
+index 183affd..d5b25e0 100644
+--- a/aiworkspace18/tests/test_english_exercise.py
++++ b/aiworkspace18/tests/test_english_exercise.py
+@@ -1,15 +1,15 @@
+ import datetime
+ import pytest
+ from shadowtalk.core.english_exercise import (
+     record_exercise, upsert_progress, get_next_word, get_stats,
+-    PRESENT_EXERCISE_TOOL,
++    PRESENT_EXERCISE_TOOL, build_scene_prompt,
+ )
+ 
+ 
+ def _seed_friend(friend_id=1):
+     """写入一条好友记录以满足外键约束（测试数据库默认无数据）。"""
+     from shadowtalk.data.database import Database
+     Database.get_connection().execute(
+         "INSERT OR IGNORE INTO friends (id, name) VALUES (?, ?)",
+         (friend_id, "test_friend")
+     )
+@@ -63,10 +63,62 @@ def test_get_stats_streak(test_database):
+         record_exercise(1, "w", "cloze", True, 1, 1.0, False)
+     stats = get_stats(1)
+     assert stats["streak"] == 5
+ 
+ 
+ def test_present_exercise_tool_schema(test_database):
+     tool = PRESENT_EXERCISE_TOOL
+     assert tool["type"] == "function"
+     assert tool["function"]["name"] == "present_exercise"
+     assert "type" in tool["function"]["parameters"]["properties"]
++
++
++# ── build_scene_prompt 测试 ──
++
++def _seed_progress(friend_id, word_range):
++    """写入进度数据：2 mastered、1 learning、1 review_due"""
++    from shadowtalk.data.database import Database
++    conn = Database.get_connection()
++    now = datetime.datetime.now()
++    past = (now - datetime.timedelta(hours=1)).isoformat()
++    rows = [
++        # mastered：连续答对 3 次且从未答错
++        (friend_id, word_range, "word_a", "mastered", None, 3, 0, now.isoformat()),
++        (friend_id, word_range, "word_b", "mastered", None, 4, 0, now.isoformat()),
++        # learning
++        (friend_id, word_range, "word_c", "learning", None, 1, 0, now.isoformat()),
++        # review_due：review_at 已到期
++        (friend_id, word_range, "word_d", "learning", past, 0, 1, now.isoformat()),
++    ]
++    conn.executemany(
++        "INSERT INTO english_progress "
++        "(friend_id, word_range, word, status, review_at, times_correct, "
++        "times_wrong, last_exercise_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
++        rows,
++    )
++
++
++def test_build_scene_prompt_injects_word_range(test_database):
++    """build_scene_prompt 应将词库范围注入场景描述"""
++    _seed_friend()
++    prompt = build_scene_prompt(1, "CET-6")
++    assert "CET-6" in prompt
++    assert "英语" in prompt
++
++
++def test_build_scene_prompt_injects_stats(test_database):
++    """build_scene_prompt 应注入当前进度统计"""
++    _seed_friend()
++    _seed_progress(1, "IELTS")
++    prompt = build_scene_prompt(1, "IELTS")
++    assert "掌握" in prompt
++    # 验证具体数字：2 mastered、1 learning、1 review_due
++    assert "2" in prompt  # mastered 数
++    assert "1" in prompt  # learning 或 review_due 数
++
++
++def test_build_scene_prompt_zero_stats(test_database):
++    """无进度数据时应返回 0 统计，不报错"""
++    _seed_friend()
++    prompt = build_scene_prompt(1, "CET-4")
++    assert "CET-4" in prompt
++    assert "0" in prompt  # 全 0 统计
+diff --git a/aiworkspace18/tests/test_english_room.py b/aiworkspace18/tests/test_english_room.py
+index ab65c41..4018ee0 100644
+--- a/aiworkspace18/tests/test_english_room.py
++++ b/aiworkspace18/tests/test_english_room.py
+@@ -693,10 +693,23 @@ def test_feedback_shown_after_wrong(room, monkeypatch):
+     card = _render(room, data)
+     card._on_cloze_click("a", card._cloze_buttons[1])
+     card._on_check_answer()
+     found = False
+     for i in range(card._layout.count()):
+         w = card._layout.itemAt(i).widget()
+         if isinstance(w, QLabel) and "错误" in w.text() and "test" in w.text():
+             found = True
+             break
+     assert found, "答错后应显示红色反馈含正确答案"
++
++
++# ── 场景 prompt 注入测试 ──
++
++def test_current_scene_prompt_uses_build_scene_prompt(room, monkeypatch):
++    """EnglishRoomWindow._current_scene_prompt 应调用 build_scene_prompt 并注入词库范围"""
++    called = []
++    monkeypatch.setattr(
++        "shadowtalk.core.english_exercise.build_scene_prompt",
++        lambda fid, wr: (called.append((fid, wr)), f"[{wr}] scene")[1])
++    prompt = room._current_scene_prompt()
++    assert called == [(room.friend_id, room._word_range)]
++    assert f"[{room._word_range}] scene" in prompt

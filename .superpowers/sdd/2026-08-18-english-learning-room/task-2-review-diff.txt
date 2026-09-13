@@ -1,0 +1,313 @@
+diff --git a/aiworkspace18/shadowtalk/core/english_exercise.py b/aiworkspace18/shadowtalk/core/english_exercise.py
+new file mode 100644
+index 0000000..e84592f
+--- /dev/null
++++ b/aiworkspace18/shadowtalk/core/english_exercise.py
+@@ -0,0 +1,229 @@
++# shadowtalk/core/english_exercise.py
++import datetime
++import logging
++
++from shadowtalk.data.database import Database
++
++logger = logging.getLogger(__name__)
++
++# 练习类型枚举（与 present_exercise 工具的 type 枚举一致）
++EXERCISE_TYPES = ("sentence_build", "cloze", "match", "translate_assemble", "story")
++
++# 复习间隔（天）：按连续答错次数递进（间隔重复算法）
++# 用户报告：错一次就当天反复刷太密 —— 改为 1/3/7 天递进
++REVIEW_INTERVALS = {1: 1, 2: 3, 3: 7}
++
++# present_exercise 工具定义：AI 用来给学生出题
++PRESENT_EXERCISE_TOOL = {
++    "type": "function",
++    "function": {
++        "name": "present_exercise",
++        "description": "给用户出一道英语练习题。当用户进入练习模式、答完上一题继续、"
++                       "或你判断需要巩固某个知识点时调用。",
++        "parameters": {
++            "type": "object",
++            "properties": {
++                "type": {
++                    "type": "string",
++                    "enum": ["sentence_build", "cloze", "match", "translate_assemble", "story"],
++                },
++                "word": {"type": "string"},
++                "prompt": {"type": "string"},
++                "words": {"type": "array", "items": {"type": "string"}},
++                "correct_order": {"type": "array", "items": {"type": "integer"}},
++                "options": {"type": "array", "items": {"type": "string"}},
++                "answer": {"type": "string"},
++                "pairs": {"type": "object"},
++                "time_limit": {"type": "integer"},
++                "story_text": {"type": "string"},
++                "choices": {"type": "array", "items": {"type": "string"}},
++                "explanation": {"type": "string"},
++            },
++            "required": ["type", "word", "answer", "explanation"],
++        },
++    },
++}
++
++
++def record_exercise(friend_id, word, exercise_type, correct, attempts=1,
++                    time_used=0.0, is_bonus=False):
++    """记录一次答题结果到 english_exercise_stats 表。
++
++    每次答题都追加一行（不做更新），便于后续统计连胜、正确率等。
++    """
++    with Database.transaction() as conn:
++        conn.execute(
++            "INSERT INTO english_exercise_stats "
++            "(friend_id, word, exercise_type, correct, attempts, time_used, is_bonus) "
++            "VALUES (?, ?, ?, ?, ?, ?, ?)",
++            (friend_id, word, exercise_type, int(bool(correct)), attempts,
++             time_used, int(bool(is_bonus)))
++        )
++    logger.debug("record_exercise: friend=%d word=%s type=%s correct=%s",
++                 friend_id, word, exercise_type, correct)
++
++
++def upsert_progress(friend_id, word_range, word, correct):
++    """更新学习进度：不存在则新建，存在则累加对/错次数并可能触发复习调度。
++
++    返回当前行字典（含 status、times_correct、times_wrong、review_at）。
++    """
++    conn = Database.get_connection()
++    row = conn.execute(
++        "SELECT * FROM english_progress "
++        "WHERE friend_id=? AND word_range=? AND word=?",
++        (friend_id, word_range, word)
++    ).fetchone()
++
++    now = datetime.datetime.now()
++
++    if row is None:
++        # 首次遇到这个词：新建记录，初始状态为 learning
++        times_correct = 1 if correct else 0
++        times_wrong = 0 if correct else 1
++        status = "learning"
++        review_at = None
++        conn.execute(
++            "INSERT INTO english_progress "
++            "(friend_id, word_range, word, status, review_at, times_correct, "
++            "times_wrong, last_exercise_at) "
++            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
++            (friend_id, word_range, word, status, review_at,
++             times_correct, times_wrong, now.isoformat())
++        )
++    else:
++        # 已有记录：累加对/错次数
++        times_correct = row["times_correct"] + (1 if correct else 0)
++        times_wrong = row["times_wrong"] + (0 if correct else 1)
++
++        # 掌握条件：连续答对 3 次且从未答错
++        if times_correct >= 3 and times_wrong == 0:
++            status = "mastered"
++            review_at = None
++        else:
++            status = "learning"
++            # 答错了：按连续答错次数安排复习时间（间隔重复）
++            if not correct:
++                # 取当前连续答错次数（这里用总错次数近似，因为每次答错都重排复习）
++                wrong_streak = times_wrong
++                interval = REVIEW_INTERVALS.get(min(wrong_streak, 3), 7)
++                review_at = (now + datetime.timedelta(days=interval)).isoformat()
++            else:
++                review_at = None
++
++        conn.execute(
++            "UPDATE english_progress SET "
++            "status=?, times_correct=?, times_wrong=?, review_at=?, "
++            "last_exercise_at=? "
++            "WHERE friend_id=? AND word_range=? AND word=?",
++            (status, times_correct, times_wrong, review_at,
++             now.isoformat(), friend_id, word_range, word)
++        )
++
++    # 返回当前行
++    conn = Database.get_connection()
++    new_row = conn.execute(
++        "SELECT * FROM english_progress "
++        "WHERE friend_id=? AND word_range=? AND word=?",
++        (friend_id, word_range, word)
++    ).fetchone()
++    return dict(new_row)
++
++
++def get_next_word(friend_id, word_range):
++    """按优先级选取下一个要练习的词。
++
++    优先级：到期的复习词 → 正在学的词 → 新词。
++    返回词字符串，没有可练的返回 None。
++    """
++    conn = Database.get_connection()
++    now = datetime.datetime.now().isoformat()
++
++    # 第一优先：review_at 已到期（含 status='review' 和 learning 但到期的）
++    row = conn.execute(
++        "SELECT word FROM english_progress "
++        "WHERE friend_id=? AND word_range=? AND review_at IS NOT NULL "
++        "AND review_at <= ? "
++        "ORDER BY review_at ASC LIMIT 1",
++        (friend_id, word_range, now)
++    ).fetchone()
++    if row:
++        return row["word"]
++
++    # 第二优先：status='learning' 的词
++    row = conn.execute(
++        "SELECT word FROM english_progress "
++        "WHERE friend_id=? AND word_range=? AND status='learning' "
++        "LIMIT 1",
++        (friend_id, word_range)
++    ).fetchone()
++    if row:
++        return row["word"]
++
++    # 第三优先：status='new' 的词
++    row = conn.execute(
++        "SELECT word FROM english_progress "
++        "WHERE friend_id=? AND word_range=? AND status='new' "
++        "LIMIT 1",
++        (friend_id, word_range)
++    ).fetchone()
++    if row:
++        return row["word"]
++
++    return None
++
++
++def get_stats(friend_id):
++    """统计当前好友的练习数据。
++
++    返回 dict：
++    - streak: 从最近一条往前数连续答对次数（不含 bonus 题）
++    - today_count: 今日答题数（不含 bonus 题）
++    - accuracy: 最近 50 次非 bonus 答题的正确率（百分比）
++    """
++    conn = Database.get_connection()
++
++    # 连胜：从最新往最旧遍历非 bonus 题，遇到答错就停
++    rows = conn.execute(
++        "SELECT correct FROM english_exercise_stats "
++        "WHERE friend_id=? AND is_bonus=0 "
++        "ORDER BY created_at DESC, id DESC",
++        (friend_id,)
++    ).fetchall()
++
++    streak = 0
++    for r in rows:
++        if r["correct"]:
++            streak += 1
++        else:
++            break
++
++    # 今日答题数（非 bonus）
++    today = datetime.date.today().isoformat()
++    row = conn.execute(
++        "SELECT COUNT(*) AS cnt FROM english_exercise_stats "
++        "WHERE friend_id=? AND is_bonus=0 AND DATE(created_at)=?",
++        (friend_id, today)
++    ).fetchone()
++    today_count = row["cnt"] if row else 0
++
++    # 最近 50 次非 bonus 答题的正确率
++    rows = conn.execute(
++        "SELECT correct FROM english_exercise_stats "
++        "WHERE friend_id=? AND is_bonus=0 "
++        "ORDER BY created_at DESC, id DESC "
++        "LIMIT 50",
++        (friend_id,)
++    ).fetchall()
++
++    if rows:
++        correct_count = sum(1 for r in rows if r["correct"])
++        accuracy = round(correct_count * 100.0 / len(rows), 1)
++    else:
++        accuracy = 0.0
++
++    return {
++        "streak": streak,
++        "today_count": today_count,
++        "accuracy": accuracy,
++    }
+diff --git a/aiworkspace18/tests/test_english_exercise.py b/aiworkspace18/tests/test_english_exercise.py
+new file mode 100644
+index 0000000..183affd
+--- /dev/null
++++ b/aiworkspace18/tests/test_english_exercise.py
+@@ -0,0 +1,72 @@
++import datetime
++import pytest
++from shadowtalk.core.english_exercise import (
++    record_exercise, upsert_progress, get_next_word, get_stats,
++    PRESENT_EXERCISE_TOOL,
++)
++
++
++def _seed_friend(friend_id=1):
++    """写入一条好友记录以满足外键约束（测试数据库默认无数据）。"""
++    from shadowtalk.data.database import Database
++    Database.get_connection().execute(
++        "INSERT OR IGNORE INTO friends (id, name) VALUES (?, ?)",
++        (friend_id, "test_friend")
++    )
++
++
++def test_record_exercise_inserts_row(test_database):
++    _seed_friend()
++    record_exercise(1, "perseverance", "sentence_build", True, 1, 5.2, False)
++    from shadowtalk.data.database import Database
++    conn = Database.get_connection()
++    row = conn.execute(
++        "SELECT * FROM english_exercise_stats WHERE friend_id=1 AND word=?",
++        ("perseverance",)).fetchone()
++    assert row is not None
++    assert row["correct"] == 1
++
++
++def test_upsert_progress_creates_new(test_database):
++    _seed_friend()
++    result = upsert_progress(1, "CET-4", "abandon", True)
++    assert result["status"] == "learning"
++    assert result["times_correct"] == 1
++
++
++def test_upsert_progress_updates_existing(test_database):
++    _seed_friend()
++    upsert_progress(1, "CET-4", "abandon", True)
++    result = upsert_progress(1, "CET-4", "abandon", False)
++    assert result["times_correct"] == 1
++    assert result["times_wrong"] == 1
++
++
++def test_get_next_word_priority(test_database):
++    _seed_friend()
++    past = (datetime.datetime.now() - datetime.timedelta(hours=1)).isoformat()
++    from shadowtalk.data.database import Database
++    conn = Database.get_connection()
++    conn.execute(
++        "INSERT INTO english_progress (friend_id, word_range, word, status, review_at) "
++        "VALUES (1, 'CET-4', 'abandon', 'review', ?)", (past,))
++    conn.execute(
++        "INSERT INTO english_progress (friend_id, word_range, word, status) "
++        "VALUES (1, 'CET-4', 'benefit', 'new')")
++    word = get_next_word(1, "CET-4")
++    assert word == "abandon"
++
++
++def test_get_stats_streak(test_database):
++    _seed_friend()
++    for _ in range(5):
++        record_exercise(1, "w", "cloze", True, 1, 1.0, False)
++    stats = get_stats(1)
++    assert stats["streak"] == 5
++
++
++def test_present_exercise_tool_schema(test_database):
++    tool = PRESENT_EXERCISE_TOOL
++    assert tool["type"] == "function"
++    assert tool["function"]["name"] == "present_exercise"
++    assert "type" in tool["function"]["parameters"]["properties"]

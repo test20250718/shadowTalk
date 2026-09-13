@@ -1,0 +1,152 @@
+diff --git a/aiworkspace18/shadowtalk/ui/widgets/english_room.py b/aiworkspace18/shadowtalk/ui/widgets/english_room.py
+index 4128896..dee071d 100644
+--- a/aiworkspace18/shadowtalk/ui/widgets/english_room.py
++++ b/aiworkspace18/shadowtalk/ui/widgets/english_room.py
+@@ -200,31 +200,33 @@ class ExerciseCard(QFrame):
+ 
+         columns = QHBoxLayout()
+         columns.setSpacing(24)
+ 
+         # 左栏：英文
+         left_col = QVBoxLayout()
+         left_col.addWidget(self._make_label("英文", color="#666666"))
+         self._left_buttons = {}
+         for en in en_words:
+             btn = self._make_chip(en)
+-            btn.clicked.connect(lambda checked, e=en: self._on_left_click(e, btn))
++            # 必须用默认参数绑定 btn（否则闭包引用循环变量，全部指向最后一个按钮）
++            btn.clicked.connect(lambda checked, e=en, b=btn: self._on_left_click(e, b))
+             left_col.addWidget(btn)
+             self._left_buttons[en] = btn
+ 
+         # 右栏：中文
+         right_col = QVBoxLayout()
+         right_col.addWidget(self._make_label("中文", color="#666666"))
+         self._right_buttons = {}
+         for zh in zh_words:
+             btn = self._make_chip(zh)
+-            btn.clicked.connect(lambda checked, z=zh: self._on_right_click(z, btn))
++            # 同上：绑定 btn 为默认参数，避免闭包陷阱
++            btn.clicked.connect(lambda checked, z=zh, b=btn: self._on_right_click(z, b))
+             right_col.addWidget(btn)
+             self._right_buttons[zh] = btn
+ 
+         columns.addLayout(left_col)
+         columns.addLayout(right_col)
+         self._layout.addLayout(columns)
+ 
+         # 计时器
+         self._time_left = time_limit
+         self._timer_label = self._make_label(f"⏱ {time_limit}s", color="#D9534F")
+@@ -375,20 +377,23 @@ class ExerciseCard(QFrame):
+         skip_btn.setStyleSheet(self._btn_secondary_style())
+         skip_btn.clicked.connect(self._on_skip)
+         row.addWidget(skip_btn)
+ 
+         self._layout.addLayout(row)
+ 
+     def _on_check_answer(self):
+         """检查答案按钮回调"""
+         if self._answered:
+             return
++        # 配对题手动提交时停止计时器（避免超时重复提交）
++        if self._data.get("type") == "match" and hasattr(self, "_match_timer"):
++            self._match_timer.stop()
+         user_answer = self._get_user_answer()
+         if self._window is not None:
+             self._window._check_answer(self, self._data, user_answer)
+ 
+     def _on_hint(self):
+         """提示按钮：显示第一个正确答案线索"""
+         if self._answered:
+             return
+         hint_text = self._get_hint()
+         if hint_text:
+diff --git a/aiworkspace18/tests/test_english_room.py b/aiworkspace18/tests/test_english_room.py
+index 9d47469..ab65c41 100644
+--- a/aiworkspace18/tests/test_english_room.py
++++ b/aiworkspace18/tests/test_english_room.py
+@@ -400,20 +400,83 @@ def test_story_correct_flow(room, monkeypatch):
+         "answer": "He took it to the police",
+         "explanation": "拾金不昧",
+     }
+     card = _render(room, data)
+     card._on_story_click("He took it to the police")
+     card._on_check_answer()
+     assert len(recorded) == 1
+     assert recorded[0][3] is True
+ 
+ 
++def test_match_full_pair_cycle_correct(room, monkeypatch):
++    """match 题型：完整左→右配对流程，全部配对正确应记录 correct=True。
++    此测试通过真实点击回调触发，能捕获闭包捕获循环变量的 bug。"""
++    recorded = []
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.record_exercise",
++        lambda *a, **k: recorded.append(a))
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.upsert_progress",
++        lambda *a, **k: None)
++
++    data = {
++        "type": "match",
++        "word": "greetings",
++        "pairs": {"Hello": "你好", "Goodbye": "再见"},
++        "answer": "你好 / 再见",
++        "explanation": "常见问候语",
++        "time_limit": 15,
++    }
++    card = _render(room, data)
++    # 停止计时器，避免测试中触发超时自动提交
++    card._match_timer.stop()
++
++    # 按正确配对依次点击左栏 + 右栏（右栏已打乱，按中文值查找按钮）
++    for en_word, zh_word in data["pairs"].items():
++        left_btn = card._left_buttons[en_word]
++        right_btn = card._right_buttons[zh_word]
++        card._on_left_click(en_word, left_btn)
++        card._on_right_click(zh_word, right_btn)
++
++    # 全部配对完成后自动提交
++    assert card._answered is True
++    assert len(recorded) == 1
++    assert recorded[0][2] == "match"
++    assert recorded[0][3] is True
++
++
++def test_match_timer_stops_on_manual_submit(room, monkeypatch):
++    """match 手动提交时应停止计时器，避免超时重复提交"""
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.record_exercise",
++        lambda *a, **k: None)
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.upsert_progress",
++        lambda *a, **k: None)
++
++    data = {
++        "type": "match",
++        "word": "greetings",
++        "pairs": {"Hello": "你好", "Goodbye": "再见"},
++        "answer": "你好 / 再见",
++        "explanation": "常见问候语",
++        "time_limit": 15,
++    }
++    card = _render(room, data)
++    # 计时器应在运行
++    assert card._match_timer.isActive()
++    # 手动提交（未配对完，直接点检查答案）
++    card._on_check_answer()
++    # 计时器应已停止
++    assert not card._match_timer.isActive()
++
++
+ # ── resume_exercise 回传测试 ──
+ def test_resume_exercise_called_after_correct_answer(room, monkeypatch):
+     """答对后应调用 ai_worker.resume_exercise"""
+     monkeypatch.setattr(
+         "shadowtalk.ui.widgets.english_room.record_exercise",
+         lambda *a, **k: None)
+     monkeypatch.setattr(
+         "shadowtalk.ui.widgets.english_room.upsert_progress",
+         lambda *a, **k: None)
+ 

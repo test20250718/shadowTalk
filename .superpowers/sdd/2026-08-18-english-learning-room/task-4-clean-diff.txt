@@ -1,0 +1,244 @@
+diff --git a/aiworkspace18/shadowtalk/ui/threads/ai_worker.py b/aiworkspace18/shadowtalk/ui/threads/ai_worker.py
+index c3efb40..4186368 100644
+--- a/aiworkspace18/shadowtalk/ui/threads/ai_worker.py
++++ b/aiworkspace18/shadowtalk/ui/threads/ai_worker.py
+@@ -1,48 +1,57 @@
+ # shadowtalk/ui/threads/ai_worker.py
++import json
+ import logging
+ import time
+ 
+ from PySide6.QtCore import QThread, Signal
+ 
+ from shadowtalk.config.settings import Settings
+ 
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+ class AIWorker(QThread):
+     finished = Signal(str)
+     failed = Signal(str)
+     approval_requested = Signal(str, list, str)  # (code, paths, reason)
+     activity = Signal(str)   # 工作过程文字（思考/执行工具/完成，供工作卡显示）
++    exercise_requested = Signal(str, str, str)   # (exercise_json, word_range, reason)
++    exercise_answered = Signal(str, str)         # (tool_call_id, result_json) — 预留，供未来使用
+ 
+     def __init__(self, friend_id, user_message, ai_client, messages: list,
+-                 work_dir: str = "", approval_answered=None):
++                 work_dir: str = "", approval_answered=None,
++                 word_range: str = ""):
+         """
+         Args:
+             friend_id: 好友 ID
+             user_message: 用户原始消息（用于日志）
+             ai_client: AI 客户端实例
+             messages: 已构建好的完整上下文（由 build_context 生成）
+             work_dir: 工作目录；目录外写入需用户审批
+             approval_answered: 审批结果信号（Signal(bool)），
+                                None 时目录外写入一律拒绝
++            word_range: 当前练习范围标记（如 NCE2-L1），随 exercise_requested 信号发出
+         """
+         super().__init__()
+         self.friend_id = friend_id
+         self.user_message = user_message
+         self.ai_client = ai_client
+         self.messages = messages
+         self.work_dir = work_dir
+         self._approval_answered = approval_answered
+         self._approved = False
++        # 练习挂起状态
++        self._word_range = word_range
++        self._exercise_loop = None
++        self._last_exercise_result = None
+         # 干活限额（用户可调）：单轮工具调用上限、单次执行超时秒数
+         self.max_tool_calls = Settings.get_int("max_tool_calls")
+         self.tool_timeout = Settings.get_int("tool_timeout")
+ 
+     def cancel(self):
+         """强制中断在途任务。
+ 
+         openai 同步调用无超时、工具执行也无超时，无法协作式取消，
+         只能 terminate()。terminate 后不会发出 finished/failed 信号，
+         由调用方（MainWindow._stop_current_worker）断开信号并保留引用。
+@@ -56,36 +65,59 @@ class AIWorker(QThread):
+             reply = self.ai_client.chat_with_tools(
+                 self.messages,
+                 tool_runner=self._run_tool,
+                 max_tool_calls=self.max_tool_calls,
+             )
+             self.finished.emit(reply)
+         except Exception as e:
+             self.failed.emit(str(e))
+ 
+     def _run_tool(self, code: str, reason: str) -> str:
+-        """执行工具代码；未配置工作目录时拒绝，目录外写需经 UI 审批。
++        """执行工具代码；present_exercise 挂起等待用户答题。
+ 
+-        前后发 activity 信号让工作卡显示当前步骤与耗时。
++        - present_exercise 工具：reason 以 "出题: " 开头且 code 是 JSON 对象字符串，
++          挂起线程发出 exercise_requested 信号，等 UI 渲染答题卡后由 resume_exercise 恢复。
++        - 其他工具：未配置工作目录时拒绝，目录外写需经 UI 审批。
+         """
++        # present_exercise 工具：挂起线程等待用户答题，不执行代码
++        # 检测方式：reason 以 "出题: " 开头且 code 是 JSON 对象字符串
++        if reason.startswith("出题: ") and code and code.strip().startswith("{"):
++            from PySide6.QtCore import QEventLoop
++            loop = QEventLoop()
++            self._exercise_loop = loop
++            self._last_exercise_result = None
++            self.exercise_requested.emit(code, self._word_range, reason)
++            loop.exec()  # 等待用户答题后 resume_exercise 调用 quit
++            self._exercise_loop = None
++            return self._last_exercise_result or json.dumps({
++                "correct": False, "user_answer": "", "correct_answer": "",
++                "attempts": 1, "time_used": 0, "exercise_type": "skip",
++                "skipped": True})
++
+         if not self.work_dir:
+             # 未配置工作目录：拒绝执行，避免写入当前进程目录
+             logger.warning("拒绝工具执行: 未配置工作目录")
+             return ("当前好友未配置工作目录。请在好友设置中添加工作目录，"
+                     "即可让我读写文件。")
+ 
+         self.activity.emit(f"执行工具：{reason or code[:20]}")
+         start = time.time()
+         result = self._execute_tool(code, reason)
+         self.activity.emit(f"工具完成（{time.time() - start:.1f} 秒），继续思考…")
+         return result
+ 
++    def resume_exercise(self, result_json: str) -> None:
++        """用户答题后恢复挂起的练习循环。由 UI 线程调用。"""
++        self._last_exercise_result = result_json
++        if self._exercise_loop is not None:
++            self._exercise_loop.quit()
++
+     def _execute_tool(self, code: str, reason: str) -> str:
+         """审批与执行（由 _run_tool 调用，activity 已在外层报告）"""
+         logger.info("执行工具: reason=%s", reason)
+ 
+         from shadowtalk.core.python_executor import (
+             run_with_approval, scan_write_paths,
+         )
+ 
+         outside_paths = scan_write_paths(code, self.work_dir)
+         # 目录内写入无需审批，直接执行
+diff --git a/aiworkspace18/tests/test_ai_worker.py b/aiworkspace18/tests/test_ai_worker.py
+index 43c6c16..6ade782 100644
+--- a/aiworkspace18/tests/test_ai_worker.py
++++ b/aiworkspace18/tests/test_ai_worker.py
+@@ -1,11 +1,13 @@
+ """AIWorker 工作目录守卫测试"""
++import json
++
+ from shadowtalk.ui.threads.ai_worker import AIWorker
+ 
+ 
+ def test_ai_worker_denies_tool_when_work_dir_empty():
+     worker = AIWorker(friend_id=1, user_message="", ai_client=None,
+                       messages=[], work_dir="")
+     reply = worker._run_tool("print('hi')", "随便")
+     # 拒绝文案的两个关键片段（源码为跨行拼接的单一字符串）
+     assert "当前好友未配置工作目录" in reply
+     assert "即可让我读写文件" in reply
+@@ -94,10 +96,100 @@ def test_run_tool_emits_activity_steps(monkeypatch):
+         lambda code, wd: [])
+ 
+     events = []
+     worker = AIWorker(friend_id=1, user_message="x", ai_client=None,
+                       messages=[], work_dir="D:/w")
+     worker.activity.connect(events.append)
+     worker._run_tool("print(1)", "生成天气报告")
+ 
+     assert any("生成天气报告" in e for e in events)
+     assert any("完成" in e for e in events)
++
++
++# ── 练习挂起/恢复机制（Task 4：英语练习出题时挂起 AIWorker，等用户答题）──
++
++def test_exercise_signals_exist():
++    """AIWorker 应有 exercise_requested 和 exercise_answered 信号"""
++    assert hasattr(AIWorker, "exercise_requested")
++    assert hasattr(AIWorker, "exercise_answered")
++
++
++def test_resume_exercise_method_exists():
++    """AIWorker 应有 resume_exercise 方法"""
++    assert hasattr(AIWorker, "resume_exercise")
++
++
++def test_exercise_suspends_and_returns_result():
++    """present_exercise 工具：_run_tool 挂起并返回用户答题结果 JSON"""
++    import threading
++    import time as _time
++
++    from PySide6.QtCore import Qt
++    from PySide6.QtWidgets import QApplication
++    # QEventLoop 需要 QApplication 存在
++    app = QApplication.instance() or QApplication([])
++
++    worker = AIWorker(friend_id=1, user_message="x", ai_client=None,
++                      messages=[], work_dir="D:/w", word_range="NCE2-L1")
++
++    # 收集 exercise_requested 信号参数（DirectConnection 确保跨线程同步触发）
++    captured = []
++    worker.exercise_requested.connect(
++        lambda *a: captured.append(a), Qt.DirectConnection)
++
++    # 在另一个线程调用 _run_tool（模拟 AI 调用 present_exercise）
++    result_holder = {}
++
++    def run_tool():
++        exercise_json = json.dumps({
++            "word": "apple", "correct": "苹果",
++            "options": ["苹果", "香蕉", "橙子", "葡萄"]
++        })
++        result_holder["result"] = worker._run_tool(exercise_json, "出题: apple")
++
++    t = threading.Thread(target=run_tool)
++    t.start()
++
++    # 等待信号发出（挂起）
++    _time.sleep(0.3)
++    assert len(captured) == 1, "exercise_requested 应已发出"
++    # 信号参数：(exercise_json, word_range, reason)
++    assert captured[0][1] == "NCE2-L1"
++    assert "出题" in captured[0][2]
++
++    # 模拟用户答题后 UI 调用 resume_exercise
++    answer_json = json.dumps({
++        "correct": True, "user_answer": "苹果", "correct_answer": "苹果",
++        "attempts": 1, "time_used": 3.2, "exercise_type": "choice"
++    })
++    worker.resume_exercise(answer_json)
++    t.join(timeout=2)
++
++    # 验证返回的是用户答题结果
++    assert json.loads(result_holder["result"])["correct"] is True
++    assert json.loads(result_holder["result"])["user_answer"] == "苹果"
++
++
++def test_exercise_resume_before_signal_is_safe():
++    """resume_exercise 在循环未启动时调用不崩溃（幂等安全）"""
++    worker = AIWorker(friend_id=1, user_message="x", ai_client=None,
++                      messages=[], work_dir="D:/w")
++    # 未启动循环时调用不应抛异常
++    worker.resume_exercise(json.dumps({"correct": False}))
++
++
++def test_regular_tool_not_misdetected_as_exercise():
++    """普通工具调用（reason 非 "出题: "）不被误判为练习"""
++    events = []
++    worker = AIWorker(friend_id=1, user_message="x", ai_client=None,
++                      messages=[], work_dir="D:/w")
++    worker.activity.connect(events.append)
++
++    # 用 monkeypatch 替换 _execute_tool 避免真正执行
++    original = worker._execute_tool
++    called = []
++    worker._execute_tool = lambda code, reason: called.append((code, reason)) or "executed"
++
++    result = worker._run_tool("print('hi')", "写文件")
++    assert result == "executed"
++    assert called == [("print('hi')", "写文件")]
++    worker._execute_tool = original

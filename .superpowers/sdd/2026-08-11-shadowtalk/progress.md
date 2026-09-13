@@ -1,0 +1,21 @@
+# SDD ledger — plan: docs/superpowers/plans/2026-08-11-shadowtalk.md
+
+Task 1: complete (commits 43a66a8..5615a07, review clean)
+Task 2: complete (commits 5615a07..f51124d, review clean)
+Task 3: complete (commits f51124d..b8b27e8, review clean)
+Task 4: complete (commits b8b27e8..fe6a07d, review clean)
+Task 5: complete (commits fe6a07d..be1afd3, review clean)
+Task 6: complete (commits be1afd3..cfef6e2, review clean)
+Task 7: complete (commits cfef6e2..62e165d, review clean)
+Task 8: complete (commits 62e165d..c737e74, review clean)
+Task 9: complete (commits c737e74..0412937, review clean)
+Task 10: complete (commits 0412937..3c78e98, review clean)
+Task 11: complete (commits 3c78e98..0f61f58, review clean)
+Task 12: complete (MessageBubble UI)
+Task 13: complete (ChatArea UI)
+Task 14: complete (AIWorker thread)
+Task 15: complete (MainWindow + main.py)
+Task 16: complete (SettingsDialog)
+Task 17: complete (requirements.txt + README)
+Final review: complete (commits eea9a2d..704f743, all findings addressed)
+

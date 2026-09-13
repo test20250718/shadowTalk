@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Skill(update-config)",
+      "Skill(update-config:*)",
+      "Bash(if [ -f ~/.claude/settings.json ]; then echo \"=== 用户级 settings.json ===\"; cat ~/.claude/settings.json; else echo \"用户级 settings.json 不存在\"; fi; echo; if [ -f .claude/settings.json ]; then echo \"=== 项目级 settings.json ===\"; cat .claude/settings.json; else echo \"项目级 settings.json 不存在\"; fi; if [ -f .claude/settings.local.json ]; then echo \"=== 项目级 settings.local.json ===\"; cat .claude/settings.local.json; else echo \"项目级 settings.local.json 不存在\"; fi)",
+      "Read(//c/Users/gene/.claude/**)",
+      "Bash(python -m pytest tests/ -q --ignore=tests/test_main_window.py)"
+    ]
+  }
+}

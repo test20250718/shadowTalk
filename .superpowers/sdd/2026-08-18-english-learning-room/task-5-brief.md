@@ -1,0 +1,156 @@
+# Task 5: Word range selection dialog
+
+**Files to create:**
+- `shadowtalk/ui/widgets/english_word_range_dialog.py`
+- `tests/test_english_word_range_dialog.py`
+
+**What to do:**
+
+Create `shadowtalk/ui/widgets/english_word_range_dialog.py`:
+
+```python
+"""英语教室词库选择对话框"""
+import logging
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QRadioButton,
+    QButtonGroup, QPushButton,
+)
+
+logger = logging.getLogger(__name__)
+
+WORD_RANGES = [
+    ("CET-4", "大学英语四级 · ~4500 词"),
+    ("CET-6", "大学英语六级 · ~5500 词"),
+    ("IELTS", "雅思核心 · ~6000 词"),
+    ("TOEFL", "托福核心 · ~8000 词"),
+]
+
+
+class EnglishWordRangeDialog(QDialog):
+    """词库范围 + 起始模式选择"""
+
+    def __init__(self, parent=None, has_progress=False):
+        super().__init__(parent)
+        self.setWindowTitle("🏫 英语教室")
+        self.setModal(True)
+        self.resize(380, 280)
+        self._has_progress = has_progress
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(10)
+
+        title = QLabel("📚 选择词库范围")
+        title.setStyleSheet("font-size: 15px; font-weight: bold; color: #1F2430;")
+        layout.addWidget(title)
+
+        self._range_group = QButtonGroup(self)
+        for key, desc in WORD_RANGES:
+            row = QHBoxLayout()
+            rb = QRadioButton(key)
+            rb.setStyleSheet("font-size: 13px; color: #1F2430;")
+            desc_lbl = QLabel(f"  {desc}")
+            desc_lbl.setStyleSheet("font-size: 11px; color: #7A7A7A;")
+            row.addWidget(rb)
+            row.addWidget(desc_lbl, 1)
+            layout.addLayout(row)
+            self._range_group.addButton(rb)
+            if key == "CET-4":
+                rb.setChecked(True)
+
+        layout.addSpacing(8)
+        mode_label = QLabel("起始方式")
+        mode_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #1F2430;")
+        layout.addWidget(mode_label)
+
+        self._mode_group = QButtonGroup(self)
+        self._continue_rb = QRadioButton("从上次进度继续")
+        self._restart_rb = QRadioButton("从头开始")
+        self._test_rb = QRadioButton("快速测试后定级")
+        for rb in (self._continue_rb, self._restart_rb, self._test_rb):
+            rb.setStyleSheet("font-size: 12px; color: #1F2430;")
+            layout.addWidget(rb)
+            self._mode_group.addButton(rb)
+        if self._has_progress:
+            self._continue_rb.setChecked(True)
+        else:
+            self._restart_rb.setChecked(True)
+            self._continue_rb.setEnabled(False)
+
+        layout.addStretch()
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        ok_btn = QPushButton("进入教室")
+        ok_btn.setStyleSheet("""
+            QPushButton { background: #2E9E57; color: white; border: none;
+                         border-radius: 8px; padding: 8px 24px; font-weight: bold; }
+            QPushButton:hover { background: #248a4a; }
+        """)
+        ok_btn.clicked.connect(self.accept)
+        btn_row.addWidget(ok_btn)
+        layout.addLayout(btn_row)
+
+    def get_selected_range(self) -> tuple:
+        """返回 (word_range, start_mode)"""
+        range_btn = self._range_group.checkedButton()
+        range_key = "CET-4"
+        for key, _ in WORD_RANGES:
+            if range_btn and range_btn.text() == key:
+                range_key = key
+                break
+        mode = "continue"
+        if self._restart_rb.isChecked():
+            mode = "restart"
+        elif self._test_rb.isChecked():
+            mode = "test"
+        return (range_key, mode)
+```
+
+**Tests for `tests/test_english_word_range_dialog.py`:**
+
+```python
+import pytest
+from PySide6.QtWidgets import QApplication
+
+app = QApplication.instance() or QApplication([])
+
+from shadowtalk.ui.widgets.english_word_range_dialog import EnglishWordRangeDialog
+
+
+def test_dialog_default_selection():
+    """默认选中 CET-4 和 restart（无进度时）"""
+    dlg = EnglishWordRangeDialog()
+    assert dlg.get_selected_range() == ("CET-4", "restart")
+
+
+def test_dialog_with_progress():
+    """有进度时默认选中 continue"""
+    dlg = EnglishWordRangeDialog(has_progress=True)
+    assert dlg.get_selected_range() == ("CET-4", "continue")
+
+
+def test_dialog_all_ranges():
+    """所有词库范围应可获取"""
+    dlg = EnglishWordRangeDialog()
+    # 验证 WORD_RANGES 常量存在且包含 4 个词库
+    from shadowtalk.ui.widgets.english_word_range_dialog import WORD_RANGES
+    assert len(WORD_RANGES) == 4
+    keys = [k for k, _ in WORD_RANGES]
+    assert "CET-4" in keys
+    assert "CET-6" in keys
+    assert "IELTS" in keys
+    assert "TOEFL" in keys
+```
+
+**Verification:**
+- `pytest tests/test_english_word_range_dialog.py -v` → PASS
+- `python -m pytest tests/ -q --ignore=tests/test_main_window.py` → all pass
+
+**Commit message:** `feat: add english word range selection dialog`
+
+**Context:** This dialog is shown when the user selects "🏫 英语教室" from the room menu (Task 8 wires it up). It lets the user pick a word range (CET-4/6, IELTS, TOEFL) and a starting mode (continue/restart/test). The `has_progress` parameter controls whether "continue from last progress" is enabled.

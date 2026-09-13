@@ -1,0 +1,152 @@
+diff --git a/aiworkspace18/shadowtalk/ui/main_window.py b/aiworkspace18/shadowtalk/ui/main_window.py
+index d4d2991..dcd588c 100644
+--- a/aiworkspace18/shadowtalk/ui/main_window.py
++++ b/aiworkspace18/shadowtalk/ui/main_window.py
+@@ -246,26 +246,27 @@ class MainWindow(QMainWindow):
+ 
+     def _on_open_room(self):
+         """沉浸式房间入口：选房间 → 选好友 → 打开全屏窗口"""
+         friends = FriendRepository.get_all()
+         if not friends:
+             self.status_bar.showMessage("还没有好友，先添加一位再邀请去房间", 6000)
+             return
+         from PySide6.QtWidgets import QInputDialog
+         room_key, ok = QInputDialog.getItem(
+             self, "选择房间", "去哪个房间？",
+-            ["☕ 咖啡馆", "🎵 音乐室", "📖 阅读室"], 0, False)
++            ["☕ 咖啡馆", "🎵 音乐室", "📖 阅读室", "🏫 英语教室"], 0, False)
+         if not ok:
+             return
+         key_map = {"☕ 咖啡馆": ("cafe", "请谁去喝咖啡？"),
+                    "🎵 音乐室": ("music", "请谁一起听歌？"),
+-                   "📖 阅读室": ("reading", "请谁一起读书？")}
++                   "📖 阅读室": ("reading", "请谁一起读书？"),
++                   "🏫 英语教室": ("english", "请谁一起学英语？")}
+         room_key_id, invite_title = key_map[room_key]
+         # 重名好友显示名追加 id 区分，避免按名匹配选错人
+         from collections import Counter
+         displays = [f["remark"] or f["name"] for f in friends]
+         dup = {n for n, c in Counter(displays).items() if c > 1}
+         items = []
+         display_to_id = {}
+         for f, disp in zip(friends, displays):
+             item = f"{disp}（{f['id']}）" if disp in dup else disp
+             items.append(item)
+@@ -275,20 +276,30 @@ class MainWindow(QMainWindow):
+         if not ok:
+             return
+         friend_id = display_to_id[name]
+         from shadowtalk.ui.widgets.room_window import RoomWindow
+         if room_key_id == "music":
+             from shadowtalk.ui.widgets.music_room import MusicRoomWindow
+             room = MusicRoomWindow(friend_id, parent=self)
+         elif room_key_id == "reading":
+             from shadowtalk.ui.widgets.reading_room import ReadingRoomWindow
+             room = ReadingRoomWindow(friend_id, parent=self)
++        elif room_key_id == "english":
++            from shadowtalk.ui.widgets.english_word_range_dialog import EnglishWordRangeDialog
++            from PySide6.QtWidgets import QDialog
++            dlg = EnglishWordRangeDialog(parent=self, has_progress=False)
++            if dlg.exec() != QDialog.Accepted:
++                return
++            word_range, start_mode = dlg.get_selected_range()
++            from shadowtalk.ui.widgets.english_room import EnglishRoomWindow
++            room = EnglishRoomWindow(friend_id, word_range=word_range,
++                                     start_mode=start_mode, parent=self)
+         else:
+             room = RoomWindow(friend_id, "cafe", parent=self)
+         # 离开房间 → 刷新主界面：当前好友的聊天区重载 + 会话列表预览更新
+         room.finished.connect(lambda: self._on_room_closed(friend_id))
+         room.show_in_screen()  # 铺满可用区域（排除任务栏，输入条不被挡）
+ 
+     def _on_room_closed(self, friend_id: int):
+         """咖啡馆里聊的消息直接落库，主界面需主动重载显示"""
+         if self.current_friend_id != friend_id:
+             return
+diff --git a/aiworkspace18/shadowtalk/ui/widgets/english_room.py b/aiworkspace18/shadowtalk/ui/widgets/english_room.py
+index dee071d..65e1e0a 100644
+--- a/aiworkspace18/shadowtalk/ui/widgets/english_room.py
++++ b/aiworkspace18/shadowtalk/ui/widgets/english_room.py
+@@ -533,20 +533,33 @@ class EnglishRoomWindow(RoomWindow):
+         self._exercise_layout = QVBoxLayout(self.exercise_panel)
+         self._exercise_layout.setContentsMargins(16, 16, 16, 16)
+         self._exercise_layout.addStretch(1)
+         # 插入到内容区右侧
+         self._content_host.addWidget(self.exercise_panel, 1)
+         # 统计标签（放在顶栏标题后）
+         self._stats_label = QLabel("")
+         self._stats_label.setStyleSheet(
+             "color: rgba(245,239,230,210); font-size: 12px; background: transparent;")
+         self._update_stats()
++        # 把统计标签插到顶栏标题右侧（self._top_layout 由父类 _build_ui 设置）
++        self._top_layout.addWidget(self._stats_label, 1)
++
++    def _on_send(self):
++        """发消息前把当前词表范围注入 worker，并连接练习请求信号"""
++        super()._on_send()
++        if self.ai_worker is not None:
++            self.ai_worker._word_range = self._word_range
++            try:
++                self.ai_worker.exercise_requested.connect(
++                    self._on_exercise_requested)
++            except RuntimeError:
++                pass  # 已连接
+ 
+     def _update_stats(self):
+         """刷新顶部统计"""
+         stats = get_stats(self.friend_id)
+         self._stats_label.setText(
+             f"🔥 连胜 {stats['streak']}  |  "
+             f"今日 {stats['today_count']} 题  |  "
+             f"正确率 {stats['accuracy']}%")
+ 
+     def _on_exercise_requested(self, code: str, word_range: str, reason: str):
+diff --git a/aiworkspace18/shadowtalk/ui/widgets/room_window.py b/aiworkspace18/shadowtalk/ui/widgets/room_window.py
+index 9621426..3330b58 100644
+--- a/aiworkspace18/shadowtalk/ui/widgets/room_window.py
++++ b/aiworkspace18/shadowtalk/ui/widgets/room_window.py
+@@ -22,21 +22,21 @@ from shadowtalk.core.room_service import (
+     build_room_context, get_room, get_room_bg, save_room_bg,
+ )
+ from shadowtalk.core.tts_service import resolve_voice
+ from shadowtalk.data.repositories import FriendRepository, MessageRepository
+ from shadowtalk.data.database import Database
+ from shadowtalk.ui.threads.ai_worker import AIWorker
+ from shadowtalk.ui.widgets.tts_player import get_player
+ 
+ logger = logging.getLogger(__name__)
+ 
+-_ROOM_ICONS = {"cafe": "☕", "music": "🎵", "reading": "📖"}
++_ROOM_ICONS = {"cafe": "☕", "music": "🎵", "reading": "📖", "english": "🏫"}
+ 
+ 
+ def _now_hhmm() -> str:
+     return datetime.now().strftime("%H:%M")
+ 
+ 
+ class RoomBubble(QWidget):
+     """悬浮对话气泡：半透明圆角；AI 侧带点播按钮"""
+     play_requested = Signal(str, int)   # (text, msg_id)
+ 
+@@ -134,20 +134,21 @@ class RoomWindow(QDialog):
+     # ── UI ──
+     def _build_ui(self):
+         layout = QVBoxLayout(self)
+         layout.setContentsMargins(0, 0, 0, 0)
+         layout.setSpacing(0)
+ 
+         # 顶部半透明工具条
+         top = QFrame()
+         top.setStyleSheet("background-color: rgba(20,16,12,120);")
+         top_l = QHBoxLayout(top)
++        self._top_layout = top_l   # 子类（英语教室）往顶栏插统计标签
+         top_l.setContentsMargins(18, 8, 14, 8)
+         icon = _ROOM_ICONS.get(self.room.get("key", ""), "🏠")
+         title = QLabel(f"{icon} {self.room['name']} · 与 {self.friend_name}")
+         title.setStyleSheet("color: #F5EFE6; font-size: 14px; background: transparent;")
+         top_l.addWidget(title)
+         top_l.addStretch()
+         bg_btn = QPushButton("换背景")
+         leave_btn = QPushButton("离开房间")
+         # QDialog 按钮默认 autoDefault=True：Enter（含输入法提交的回车）
+         # 会激活"默认按钮"——创建顺序第一个是换背景 → 误弹文件选择框。

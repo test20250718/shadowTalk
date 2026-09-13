@@ -1,0 +1,1299 @@
+diff --git a/aiworkspace18/shadowtalk/ui/widgets/english_room.py b/aiworkspace18/shadowtalk/ui/widgets/english_room.py
+index 6ee27dd..4128896 100644
+--- a/aiworkspace18/shadowtalk/ui/widgets/english_room.py
++++ b/aiworkspace18/shadowtalk/ui/widgets/english_room.py
+@@ -1,54 +1,517 @@
++# shadowtalk/ui/widgets/english_room.py
+ """沉浸式英语教室：左聊右练，AI 驱动练习卡片。
+ 
+ 复用 RoomWindow 骨架：左侧窄聊天区（280px）+ 右侧练习卡片面板。
+ AI 通过 present_exercise 工具在右侧出题，用户答题后结果回传 AI。
+ 设计文档：docs/superpowers/specs/2026-08-18-english-learning-room-design.md
+ """
+ import json
+ import logging
++import random
+ import time
+ 
+-from PySide6.QtCore import Qt, Signal
++from PySide6.QtCore import Qt, Signal, QTimer
+ from PySide6.QtWidgets import (
+     QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame, QScrollArea,
+     QWidget, QButtonGroup, QRadioButton, QLineEdit,
+ )
+ 
+ from shadowtalk.core.english_exercise import (
+     record_exercise, upsert_progress, get_stats,
+ )
+ from shadowtalk.ui.widgets.room_window import RoomBubble, RoomWindow
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+ class ExerciseCard(QFrame):
+-    """练习卡片基类：题型渲染 + 答题回传"""
++    """练习卡片：5 种题型渲染 + 答题回传。
++
++    题型分派在 _render() 中按 data["type"] 分发到 _render_<type>()。
++    每张卡片持有对 EnglishRoomWindow 的弱引用（self._window），
++    答完 / 跳过 时回调 window 的 _check_answer / _skip_exercise。
++    """
+ 
+     answered = Signal(str, dict)  # (tool_call_id, result_dict)
+ 
+-    def __init__(self, exercise_data: dict, tool_call_id: str = "", parent=None):
++    def __init__(self, exercise_data: dict, tool_call_id: str = "",
++                 window=None, parent=None):
+         super().__init__(parent)
+         self._data = exercise_data
+         self._tool_call_id = tool_call_id
++        self._window = window
+         self._start_time = time.time()
+         self._attempts = 0
+         self._answered = False
+         self._layout = QVBoxLayout(self)
+         self._layout.setContentsMargins(16, 16, 16, 16)
+         self._layout.setSpacing(8)
+         self.setStyleSheet("""
+             QFrame { background-color: rgba(255,255,255,235);
+                      border-radius: 16px; }
+             QLabel { color: #1F2430; background: transparent; }
+         """)
++        self._render()
++
++    # ── 题型分派 ──
++    def _render(self):
++        """按 type 字段分派到具体渲染方法"""
++        dispatch = {
++            "sentence_build": self._render_sentence_build,
++            "cloze": self._render_cloze,
++            "match": self._render_match,
++            "translate_assemble": self._render_translate_assemble,
++            "story": self._render_story,
++        }
++        renderer = dispatch.get(self._data.get("type"), self._render_unknown)
++        renderer()
++        self._add_action_buttons()
++
++    # ── 题型 1：拖拽组句（sentence_build）──
++    def _render_sentence_build(self):
++        """点击单词芯片组句：词池 → 构建区 → 词池"""
++        self._build_type = "sentence_build"
++        prompt = self._data.get("prompt", "请将下列单词排列成正确的句子：")
++        self._layout.addWidget(self._make_label(prompt, bold=True))
++
++        words = self._data.get("words", [])
++        correct_order = self._data.get("correct_order", list(range(len(words))))
++        # 预计算正确答案字符串（用于比对）
++        self._correct_sentence = " ".join(words[i] for i in correct_order)
++
++        # 构建顺序：记录用户点击的词索引
++        self._build_indices = []
++
++        # 词池区
++        self._layout.addWidget(self._make_label("单词池：", color="#666666"))
++        pool_wrap = QWidget()
++        pool_wrap.setStyleSheet("background: transparent;")
++        self._pool_layout = QHBoxLayout(pool_wrap)
++        self._pool_layout.setSpacing(6)
++        self._pool_layout.setContentsMargins(0, 0, 0, 0)
++        self._pool_layout.addStretch(1)
++        self._layout.addWidget(pool_wrap)
++
++        # 构建区
++        self._layout.addWidget(self._make_label("你的句子：", color="#666666"))
++        build_wrap = QWidget()
++        build_wrap.setStyleSheet("background: transparent;")
++        self._build_layout = QHBoxLayout(build_wrap)
++        self._build_layout.setSpacing(6)
++        self._build_layout.setContentsMargins(0, 0, 0, 0)
++        self._build_layout.addStretch(1)
++        self._layout.addWidget(build_wrap)
++
++        # 创建词芯片
++        self._pool_chips = {}   # idx -> QPushButton（在词池中）
++        self._build_chips = {}  # idx -> QPushButton（在构建区）
++        for i, word in enumerate(words):
++            btn = self._make_chip(word)
++            # 默认闭包陷阱：用默认参数绑定当前 i
++            btn.clicked.connect(lambda checked, idx=i: self._on_pool_click(idx))
++            self._pool_layout.insertWidget(self._pool_layout.count() - 1, btn)
++            self._pool_chips[i] = btn
++
++    def _on_pool_click(self, idx):
++        """词池芯片点击 → 移到构建区"""
++        if self._answered or idx not in self._pool_chips:
++            return
++        btn = self._pool_chips.pop(idx)
++        self._pool_layout.removeWidget(btn)
++        btn.hide()
++        self._build_indices.append(idx)
++        new_btn = self._make_chip(btn.text())
++        new_btn.clicked.connect(lambda checked, i=idx: self._on_build_click(i))
++        self._build_layout.insertWidget(self._build_layout.count() - 1, new_btn)
++        self._build_chips[idx] = new_btn
++
++    def _on_build_click(self, idx):
++        """构建区芯片点击 → 退回词池"""
++        if self._answered or idx not in self._build_chips:
++            return
++        btn = self._build_chips.pop(idx)
++        self._build_layout.removeWidget(btn)
++        btn.hide()
++        self._build_indices.remove(idx)
++        new_btn = self._make_chip(btn.text())
++        new_btn.clicked.connect(lambda checked, i=idx: self._on_pool_click(i))
++        self._pool_layout.insertWidget(self._pool_layout.count() - 1, new_btn)
++        self._pool_chips[idx] = new_btn
++
++    def _get_sentence(self):
++        """获取当前构建区的句子"""
++        words = self._data.get("words", [])
++        return " ".join(words[i] for i in self._build_indices)
++
++    # ── 题型 2：选词填空（cloze）──
++    def _render_cloze(self):
++        """显示含空白的句子 + 4 个选项按钮"""
++        self._build_type = "cloze"
++        prompt = self._data.get("prompt", "")
++        # 把 ____ 渲染成可见空白
++        display = prompt.replace("____", "______")
++        self._layout.addWidget(self._make_label(display, bold=False))
++
++        options = self._data.get("options", [])
++        self._selected_option = None
++
++        opts_wrap = QWidget()
++        opts_wrap.setStyleSheet("background: transparent;")
++        opts_layout = QHBoxLayout(opts_wrap)
++        opts_layout.setSpacing(8)
++        opts_layout.setContentsMargins(0, 0, 0, 0)
++        self._cloze_buttons = []
++        for opt in options:
++            btn = self._make_chip(opt)
++            btn.clicked.connect(lambda checked, o=opt, b=btn: self._on_cloze_click(o, b))
++            opts_layout.addWidget(btn)
++            self._cloze_buttons.append(btn)
++        self._layout.addWidget(opts_wrap)
++
++    def _on_cloze_click(self, option, btn):
++        """选中一个选项：高亮当前、取消其他"""
++        if self._answered:
++            return
++        self._selected_option = option
++        for b in self._cloze_buttons:
++            b.setStyleSheet(self._chip_style())
++        btn.setStyleSheet(self._chip_selected_style())
++
++    # ── ── 题型 3：闪电配对（match）──
++    def _render_match(self):
++        """左右两栏：英文 ↔ 中文，点击配对；计时器倒计时"""
++        self._build_type = "match"
++        pairs = self._data.get("pairs", {})
++        time_limit = self._data.get("time_limit", 15)
++
++        self._layout.addWidget(
++            self._make_label(f"⚡ 闪电配对（{time_limit} 秒）：", bold=True))
++
++        # 配对状态
++        self._matched = {}          # en_word -> zh_word（已配对）
++        self._selected_left = None  # 当前选中的英文
++        self._match_pairs = pairs
++        self._match_total = len(pairs)
++
++        # 打乱中文顺序（避免位置提示）
++        en_words = list(pairs.keys())
++        zh_words = list(pairs.values())
++        random.shuffle(zh_words)
++
++        columns = QHBoxLayout()
++        columns.setSpacing(24)
++
++        # 左栏：英文
++        left_col = QVBoxLayout()
++        left_col.addWidget(self._make_label("英文", color="#666666"))
++        self._left_buttons = {}
++        for en in en_words:
++            btn = self._make_chip(en)
++            btn.clicked.connect(lambda checked, e=en: self._on_left_click(e, btn))
++            left_col.addWidget(btn)
++            self._left_buttons[en] = btn
++
++        # 右栏：中文
++        right_col = QVBoxLayout()
++        right_col.addWidget(self._make_label("中文", color="#666666"))
++        self._right_buttons = {}
++        for zh in zh_words:
++            btn = self._make_chip(zh)
++            btn.clicked.connect(lambda checked, z=zh: self._on_right_click(z, btn))
++            right_col.addWidget(btn)
++            self._right_buttons[zh] = btn
++
++        columns.addLayout(left_col)
++        columns.addLayout(right_col)
++        self._layout.addLayout(columns)
++
++        # 计时器
++        self._time_left = time_limit
++        self._timer_label = self._make_label(f"⏱ {time_limit}s", color="#D9534F")
++        self._layout.addWidget(self._timer_label)
++        self._match_timer = QTimer(self)
++        self._match_timer.timeout.connect(self._on_match_tick)
++        self._match_timer.start(1000)
++
++    def _on_left_click(self, en_word, btn):
++        """选中左栏英文"""
++        if self._answered:
++            return
++        self._selected_left = en_word
++        for b in self._left_buttons.values():
++            b.setStyleSheet(self._chip_style())
++        btn.setStyleSheet(self._chip_selected_style())
++
++    def _on_right_click(self, zh_word, btn):
++        """选中右栏中文 → 与当前英文配对"""
++        if self._answered or self._selected_left is None:
++            return
++        en_word = self._selected_left
++        self._matched[en_word] = zh_word
++        # 禁用已配对按钮
++        self._left_buttons[en_word].setEnabled(False)
++        self._left_buttons[en_word].setStyleSheet(self._chip_disabled_style())
++        btn.setEnabled(False)
++        btn.setStyleSheet(self._chip_disabled_style())
++        self._selected_left = None
++        # 全部配对完成 → 自动提交
++        if len(self._matched) >= self._match_total:
++            self._match_timer.stop()
++            self._submit_match(auto=True)
++
++    def _on_match_tick(self):
++        """计时器滴答：减一秒，到 0 自动提交"""
++        self._time_left -= 1
++        self._timer_label.setText(f"⏱ {self._time_left}s")
++        if self._time_left <= 0:
++            self._match_timer.stop()
++            self._submit_match(auto=True)
++
++    def _submit_match(self, auto=False):
++        """配对题提交（自动或手动）"""
++        if self._answered:
++            return
++        # 配对题答案格式：按英文顺序排列的中文，用 / 分隔
++        pairs = self._match_pairs
++        zh_list = [self._matched.get(en, "") for en in pairs.keys()]
++        user_answer = " / ".join(zh_list)
++        if self._window is not None:
++            self._window._check_answer(self, self._data, user_answer)
++
++    # ── 题型 4：翻译拼装（translate_assemble）──
++    def _render_translate_assemble(self):
++        """中文提示 + 英文词芯片（含干扰词），按顺序点击拼装翻译"""
++        self._build_type = "translate_assemble"
++        prompt = self._data.get("prompt", "请翻译：")
++        self._layout.addWidget(self._make_label(prompt, bold=True))
++
++        words = self._data.get("words", [])
++        correct_order = self._data.get("correct_order", list(range(len(words))))
++        self._correct_sentence = " ".join(words[i] for i in correct_order)
++        self._build_indices = []
++
++        self._layout.addWidget(
++            self._make_label("点击单词按顺序拼装英文翻译：", color="#666666"))
++
++        # 词池
++        pool_wrap = QWidget()
++        pool_wrap.setStyleSheet("background: transparent;")
++        self._pool_layout = QHBoxLayout(pool_wrap)
++        self._pool_layout.setSpacing(6)
++        self._pool_layout.setContentsMargins(0, 0, 0, 0)
++        self._pool_layout.addStretch(1)
++        self._layout.addWidget(pool_wrap)
++
++        # 构建区
++        build_wrap = QWidget()
++        build_wrap.setStyleSheet("background: transparent;")
++        self._build_layout = QHBoxLayout(build_wrap)
++        self._build_layout.setSpacing(6)
++        self._build_layout.setContentsMargins(0, 0, 0, 0)
++        self._build_layout.addStretch(1)
++        self._layout.addWidget(build_wrap)
++
++        self._pool_chips = {}
++        self._build_chips = {}
++        for i, word in enumerate(words):
++            btn = self._make_chip(word)
++            btn.clicked.connect(lambda checked, idx=i: self._on_pool_click(idx))
++            self._pool_layout.insertWidget(self._pool_layout.count() - 1, btn)
++            self._pool_chips[i] = btn
++
++    # ── 题型 5：故事分支（story）──
++    def _render_story(self):
++        """英文故事 + 多个选项，单选"""
++        self._build_type = "story"
++        story_text = self._data.get("story_text", "")
++        self._layout.addWidget(self._make_label(story_text, bold=False))
++
++        choices = self._data.get("choices", [])
++        self._selected_choice = None
++
++        self._story_group = QButtonGroup(self)
++        self._story_group.setExclusive(True)
++        self._story_buttons = []
++        for i, choice in enumerate(choices):
++            btn = QRadioButton(choice)
++            btn.setStyleSheet("font-size: 13px; padding: 4px 0; background: transparent;")
++            btn.clicked.connect(lambda checked, c=choice: self._on_story_click(c))
++            self._story_group.addButton(btn, i)
++            self._layout.addWidget(btn)
++            self._story_buttons.append(btn)
++
++    def _on_story_click(self, choice):
++        """选中一个故事选项"""
++        if self._answered:
++            return
++        self._selected_choice = choice
++
++    def _render_unknown(self):
++        """未知题型兜底"""
++        self._build_type = "unknown"
++        self._layout.addWidget(
++            self._make_label(f"未知题型：{self._data.get('type')}", color="#D9534F"))
++
++    # ── 操作按钮（检查答案 / 提示 / 跳过）──
++    def _add_action_buttons(self):
++        """底部操作按钮行"""
++        row = QHBoxLayout()
++        row.addStretch(1)
++
++        self._check_btn = QPushButton("检查答案")
++        self._check_btn.setCursor(Qt.PointingHandCursor)
++        self._check_btn.setStyleSheet(self._btn_primary_style())
++        self._check_btn.clicked.connect(self._on_check_answer)
++        row.addWidget(self._check_btn)
++
++        hint_btn = QPushButton("提示")
++        hint_btn.setCursor(Qt.PointingHandCursor)
++        hint_btn.setStyleSheet(self._btn_secondary_style())
++        hint_btn.clicked.connect(self._on_hint)
++        row.addWidget(hint_btn)
++
++        skip_btn = QPushButton("跳过")
++        skip_btn.setCursor(Qt.PointingHandCursor)
++        skip_btn.setStyleSheet(self._btn_secondary_style())
++        skip_btn.clicked.connect(self._on_skip)
++        row.addWidget(skip_btn)
++
++        self._layout.addLayout(row)
++
++    def _on_check_answer(self):
++        """检查答案按钮回调"""
++        if self._answered:
++            return
++        user_answer = self._get_user_answer()
++        if self._window is not None:
++            self._window._check_answer(self, self._data, user_answer)
++
++    def _on_hint(self):
++        """提示按钮：显示第一个正确答案线索"""
++        if self._answered:
++            return
++        hint_text = self._get_hint()
++        if hint_text:
++            label = self._make_label(f"💡 {hint_text}", color="#2E9E57")
++            self._layout.insertWidget(self._layout.count() - 1, label)
++
++    def _on_skip(self):
++        """跳过按钮回调"""
++        if self._answered:
++            return
++        if self._window is not None:
++            self._window._skip_exercise(self, self._data)
++
++    # ── 获取用户答案 ──
++    def _get_user_answer(self):
++        """按题型返回用户答案字符串"""
++        t = self._data.get("type")
++        if t == "sentence_build":
++            return self._get_sentence()
++        if t == "cloze":
++            return self._selected_option or ""
++        if t == "match":
++            # 配对题：按英文顺序列出中文
++            pairs = self._data.get("pairs", {})
++            zh_list = [self._matched.get(en, "") for en in pairs.keys()]
++            return " / ".join(zh_list)
++        if t == "translate_assemble":
++            return self._get_sentence()
++        if t == "story":
++            return self._selected_choice or ""
++        return ""
++
++    def _get_hint(self):
++        """按题型返回提示文字"""
++        t = self._data.get("type")
++        if t == "sentence_build":
++            correct = self._data.get("correct_order", [])
++            words = self._data.get("words", [])
++            if correct and words:
++                return f"第一个词是：{words[correct[0]]}"
++        elif t == "cloze":
++            return f"正确答案是：{self._data.get('answer', '')}"
++        elif t == "match":
++            pairs = self._data.get("pairs", {})
++            if pairs:
++                first_en = next(iter(pairs))
++                return f"{first_en} → {pairs[first_en]}"
++        elif t == "translate_assemble":
++            correct = self._data.get("correct_order", [])
++            words = self._data.get("words", [])
++            if correct and words:
++                return f"第一个词是：{words[correct[0]]}"
++        elif t == "story":
++            return f"正确选项是：{self._data.get('answer', '')}"
++        return ""
++
++    # ── 样式工具 ──
++    @staticmethod
++    def _make_label(text, bold=False, color="#1F2430"):
++        label = QLabel(text)
++        label.setWordWrap(True)
++        weight = "bold" if bold else "normal"
++        label.setStyleSheet(
++            f"color: {color}; font-size: 13px; font-weight: {weight};"
++            f" background: transparent; padding: 2px 0;")
++        return label
++
++    @staticmethod
++    def _make_chip(text):
++        btn = QPushButton(text)
++        btn.setCursor(Qt.PointingHandCursor)
++        btn.setStyleSheet(ExerciseCard._chip_style())
++        return btn
++
++    @staticmethod
++    def _chip_style():
++        return """
++            QPushButton { background-color: rgba(70,130,180,200); color: white;
++                          border: none; border-radius: 10px;
++                          padding: 6px 14px; font-size: 13px; }
++            QPushButton:hover { background-color: rgba(50,110,160,230); }
++        """
++
++    @staticmethod
++    def _chip_selected_style():
++        return """
++            QPushButton { background-color: rgba(46,158,87,235); color: white;
++                          border: 2px solid #1F2430; border-radius: 10px;
++                          padding: 6px 14px; font-size: 13px; }
++        """
++
++    @staticmethod
++    def _chip_disabled_style():
++        return """
++            QPushButton { background-color: rgba(200,200,200,150); color: #999;
++                          border: none; border-radius: 10px;
++                          padding: 6px 14px; font-size: 13px; }
++        """
++
++    @staticmethod
++    def _btn_primary_style():
++        return """
++            QPushButton { background-color: rgba(46,158,87,235); color: white;
++                          border: none; border-radius: 10px;
++                          padding: 6px 18px; font-size: 13px; font-weight: bold; }
++            QPushButton:hover { background-color: rgba(38,138,76,245); }
++        """
++
++    @staticmethod
++    def _btn_secondary_style():
++        return """
++            QPushButton { background-color: rgba(120,120,120,180); color: white;
++                          border: none; border-radius: 10px;
++                          padding: 6px 18px; font-size: 13px; }
++            QPushButton:hover { background-color: rgba(100,100,100,220); }
++        """
+ 
+ 
+ class EnglishRoomWindow(RoomWindow):
+     """英语教室：左聊右练"""
+ 
+     def __init__(self, friend_id: int, word_range: str = "CET-4",
+                  start_mode: str = "restart", parent=None):
+         self._word_range = word_range
+         self._start_mode = start_mode
+         self._current_card = None
+@@ -86,28 +549,103 @@ class EnglishRoomWindow(RoomWindow):
+         self.input_edit.setEnabled(False)
+         self.send_btn.setEnabled(False)
+         try:
+             data = json.loads(code)
+         except (json.JSONDecodeError, TypeError):
+             logger.error("解析练习数据失败: %s", code[:100])
+             return
+         self._render_exercise_card(data)
+ 
+     def _render_exercise_card(self, data: dict):
+-        """根据题型渲染对应卡片（Task 7 实现具体渲染）"""
++        """根据题型渲染对应卡片"""
+         # 清除旧卡片
+         if self._current_card is not None:
+             self._exercise_layout.removeWidget(self._current_card)
+             self._current_card.deleteLater()
+             self._current_card = None
+-        # Task 7 will implement the actual card rendering
+-        placeholder = QLabel("练习卡片加载中…")
+-        placeholder.setStyleSheet("font-size: 14px; color: #7A7A7A;")
++        # 创建新卡片（构造函数内完成渲染）
++        card = ExerciseCard(data, window=self, parent=self.exercise_panel)
++        # 插到 stretch 之前（靠上显示）
+         self._exercise_layout.insertWidget(
+-            self._exercise_layout.count() - 1, placeholder)
+-        self._current_card = placeholder
++            self._exercise_layout.count() - 1, card)
++        self._current_card = card
++
++    # ── 答题回传 ──
++    def _check_answer(self, card, data, user_answer):
++        """检查答案：落库 + 显示反馈 + 回传 AI + 启用输入"""
++        if card._answered:
++            return
++        card._answered = True
++        card._attempts += 1
++        correct_answer = data.get("answer", "")
++        correct = user_answer.strip().lower() == correct_answer.strip().lower()
++        time_used = time.time() - card._start_time
++        is_bonus = data.get("is_bonus", False)
++
++        # 落库
++        record_exercise(self.friend_id, data.get("word", ""),
++                        data.get("type", ""), correct,
++                        card._attempts, time_used, is_bonus)
++        upsert_progress(self.friend_id, self._word_range,
++                        data.get("word", ""), correct)
++
++        # 显示反馈
++        self._show_feedback(card, correct, correct_answer,
++                            data.get("explanation", ""))
++
++        # 回传 AI
++        result = {
++            "correct": correct,
++            "user_answer": user_answer,
++            "correct_answer": correct_answer,
++            "attempts": card._attempts,
++            "time_used": time_used,
++            "exercise_type": data.get("type", ""),
++            "skipped": False,
++        }
++        if self.ai_worker is not None:
++            self.ai_worker.resume_exercise(json.dumps(result))
++
++        self._update_stats()
++        # 启用输入条
++        self.input_edit.setEnabled(True)
++        self.send_btn.setEnabled(True)
++
++    def _skip_exercise(self, card, data):
++        """跳过练习：回传 AI + 启用输入"""
++        if card._answered:
++            return
++        card._answered = True
++        result = {
++            "correct": False,
++            "user_answer": "",
++            "correct_answer": data.get("answer", ""),
++            "attempts": 0,
++            "time_used": 0,
++            "exercise_type": data.get("type", ""),
++            "skipped": True,
++        }
++        if self.ai_worker is not None:
++            self.ai_worker.resume_exercise(json.dumps(result))
++        self.input_edit.setEnabled(True)
++        self.send_btn.setEnabled(True)
++
++    def _show_feedback(self, card, correct, correct_answer, explanation):
++        """在卡片中显示答题反馈"""
++        feedback = QLabel()
++        if correct:
++            feedback.setText(f"✅ 正确！\n{explanation}")
++            feedback.setStyleSheet(
++                "color: #2E9E57; font-size: 13px; padding: 8px;"
++                " background: transparent;")
++        else:
++            feedback.setText(f"❌ 错误。正确答案：{correct_answer}\n{explanation}")
++            feedback.setStyleSheet(
++                "color: #D9534F; font-size: 13px; padding: 8px;"
++                " background: transparent;")
++        card._layout.addWidget(feedback)
+ 
+     def closeEvent(self, event):
+         if self._current_card is not None:
+             self._current_card.deleteLater()
+             self._current_card = None
+         super().closeEvent(event)
+diff --git a/aiworkspace18/tests/test_english_room.py b/aiworkspace18/tests/test_english_room.py
+index bf9b69a..9d47469 100644
+--- a/aiworkspace18/tests/test_english_room.py
++++ b/aiworkspace18/tests/test_english_room.py
+@@ -1,58 +1,91 @@
+-"""沉浸式英语教室 UI 测试：骨架与布局"""
++"""沉浸式英语教室 UI 测试：5 种题型渲染 + 答题回传。"""
++import json
+ import sys
+ 
+ import pytest
+ from PySide6.QtWidgets import QApplication, QLabel
+ 
+ from shadowtalk.data.database import Database
+ from shadowtalk.data.repositories import FriendRepository
+ 
+ Database.get_connection()   # 触发 rooms/迁移播种
+ 
+ app = QApplication.instance() or QApplication(sys.argv)
+ 
+ 
+ def _make_friend(name="小学"):
+     return FriendRepository.insert(name, "", "你是小学")
+ 
+ 
++class _FakeSignal:
++    """伪 Qt 信号：支持 connect / disconnect，调用时静默"""
++    def __init__(self):
++        self._slots = []
++
++    def connect(self, slot):
++        self._slots.append(slot)
++
++    def disconnect(self, slot=None):
++        if slot is None:
++            self._slots.clear()
++        else:
++            self._slots = [s for s in self._slots if s != slot]
++
++    def emit(self, *a, **k):
++        for s in self._slots:
++            try:
++                s(*a, **k)
++            except Exception:
++                pass
++
++
+ class _FakeWorker:
+-    """伪 AIWorker：提供 window 所需的信号接口"""
++    """伪 AIWorker：提供 window 所需的信号接口，记录 resume_exercise 调用"""
++    finished = _FakeSignal()
++    failed = _FakeSignal()
++    approval_requested = _FakeSignal()
++    activity = _FakeSignal()
++
+     def __init__(self, *a, **k):
+         self.messages = k.get("messages", a[3] if len(a) > 3 else [])
++        self.resumed = []   # 记录每次 resume_exercise 的 result_json
+ 
+     def cancel(self):
+         pass
+ 
+     def isRunning(self):
+         return False
+ 
+     def wait(self, ms):
+         return True
+ 
+     def start(self):
+         pass
+ 
++    def resume_exercise(self, result_json):
++        self.resumed.append(result_json)
++
+ 
+ @pytest.fixture()
+ def room(monkeypatch):
+     from shadowtalk.ui.widgets import room_window as rw
+     from shadowtalk.ui.widgets.english_room import EnglishRoomWindow
+     fid = _make_friend()
+     monkeypatch.setattr(rw, "AIWorker", lambda *a, **k: _FakeWorker(*a, **k))
+     monkeypatch.setattr(rw, "AIClient", lambda *a, **k: object())
+     win = EnglishRoomWindow(fid)
+     yield win
+     win.close()
+ 
+ 
++# ── 骨架测试（保留）──
+ def test_english_room_window_class():
+     """EnglishRoomWindow 应继承 RoomWindow"""
+     from shadowtalk.ui.widgets.english_room import EnglishRoomWindow
+     from shadowtalk.ui.widgets.room_window import RoomWindow
+     assert issubclass(EnglishRoomWindow, RoomWindow)
+ 
+ 
+ def test_english_room_subclass_instance(room):
+     """实例化后是 RoomWindow 的子类实例"""
+     from shadowtalk.ui.widgets.room_window import RoomWindow
+@@ -60,69 +93,547 @@ def test_english_room_subclass_instance(room):
+ 
+ 
+ def test_chat_scroll_fixed_width(room):
+     """左侧聊天区固定 280px"""
+     assert room.chat_scroll.width() == 280
+ 
+ 
+ def test_exercise_panel_exists(room):
+     """右侧练习面板已创建"""
+     assert room.exercise_panel is not None
+-    # 练习面板是内容区宿主的一个子部件
+     found = False
+     for i in range(room._content_host.count()):
+         if room._content_host.itemAt(i).widget() is room.exercise_panel:
+             found = True
+             break
+     assert found, "exercise_panel 应在 _content_host 中"
+ 
+ 
+ def test_stats_label_exists(room):
+     """顶部统计标签已创建"""
+     assert room._stats_label is not None
+-    # 统计标签应包含连胜/今日/正确率三栏
+     text = room._stats_label.text()
+     assert "连胜" in text
+     assert "今日" in text
+     assert "正确率" in text
+ 
+ 
+ def test_exercise_requested_disables_input(room):
+     """AI 出题时应禁用输入栏"""
+     room.input_edit.setEnabled(True)
+     room.send_btn.setEnabled(True)
+     room._on_exercise_requested(
+         '{"type":"cloze","word":"test","answer":"test","explanation":"test"}',
+         "CET-4", "出题: 测试")
+     assert room.input_edit.isEnabled() is False
+     assert room.send_btn.isEnabled() is False
+ 
+ 
+-def test_exercise_requested_renders_placeholder(room):
+-    """AI 出题时渲染占位卡片（Task 7 替换为真实渲染）"""
+-    room._on_exercise_requested(
+-        '{"type":"cloze","word":"test","answer":"test","explanation":"test"}',
+-        "CET-4", "出题: 测试")
+-    assert room._current_card is not None
+-    # 占位卡片本身是 QLabel（含"加载中"文字）
+-    from PySide6.QtWidgets import QLabel
+-    assert isinstance(room._current_card, QLabel)
+-    assert "加载" in room._current_card.text()
+-
+-
+ def test_exercise_requested_invalid_json_no_crash(room):
+     """无效 JSON 不应崩溃，仅记日志"""
+-    # 不应抛异常
+     room._on_exercise_requested("not-json", "CET-4", "出题: 测试")
+-    # 不应渲染卡片
+-    # （无效 JSON 时 _render_exercise_card 未被调用，_current_card 保持原样）
+ 
+ 
+ def test_close_event_cleans_up_card(room):
+     """关闭窗口应清理当前卡片"""
+     room._on_exercise_requested(
+         '{"type":"cloze","word":"test","answer":"test","explanation":"test"}',
+         "CET-4", "出题: 测试")
+     assert room._current_card is not None
+     room.close()
+-    # closeEvent 将 _current_card 置 None
+     assert room._current_card is None
++
++
++# ── 5 种题型渲染测试 ──
++def _render(room, data_dict):
++    """辅助：触发渲染并返回当前卡片"""
++    room._on_exercise_requested(json.dumps(data_dict), "CET-4", "出题: 测试")
++    return room._current_card
++
++
++def test_sentence_build_renders(room):
++    """sentence_build 题型应渲染为 ExerciseCard"""
++    from shadowtalk.ui.widgets.english_room import ExerciseCard
++    data = {
++        "type": "sentence_build",
++        "word": "perseverance",
++        "prompt": "排列成句",
++        "words": ["She", "never", "gives", "up"],
++        "correct_order": [0, 1, 2, 3],
++        "answer": "She never gives up",
++        "explanation": "主语 + 副词 + 动词短语",
++    }
++    card = _render(room, data)
++    assert isinstance(card, ExerciseCard)
++    assert card._data["type"] == "sentence_build"
++    # 词池应有 4 个芯片
++    assert len(card._pool_chips) == 4
++
++
++def test_cloze_renders(room):
++    """cloze 题型应渲染为 ExerciseCard"""
++    from shadowtalk.ui.widgets.english_room import ExerciseCard
++    data = {
++        "type": "cloze",
++        "word": "perseverance",
++        "prompt": "She showed great ____ in the face of adversity.",
++        "options": ["perseverance", "ignorance", "fragility", "arrogance"],
++        "answer": "perseverance",
++        "explanation": "perseverance 意为毅力",
++    }
++    card = _render(room, data)
++    assert isinstance(card, ExerciseCard)
++    assert len(card._cloze_buttons) == 4
++
++
++def test_match_renders(room):
++    """match 题型应渲染为 ExerciseCard"""
++    from shadowtalk.ui.widgets.english_room import ExerciseCard
++    data = {
++        "type": "match",
++        "word": "greetings",
++        "pairs": {"Hello": "你好", "Goodbye": "再见", "Thank you": "谢谢"},
++        "answer": "Hello-你好/Goodbye-再见/Thank you-谢谢",
++        "explanation": "常见问候语",
++        "time_limit": 15,
++    }
++    card = _render(room, data)
++    assert isinstance(card, ExerciseCard)
++    assert len(card._left_buttons) == 3
++    assert len(card._right_buttons) == 3
++
++
++def test_translate_assemble_renders(room):
++    """translate_assemble 题型应渲染为 ExerciseCard"""
++    from shadowtalk.ui.widgets.english_room import ExerciseCard
++    data = {
++        "type": "translate_assemble",
++        "word": "study",
++        "prompt": "我正在学习英语",
++        "words": ["I", "am", "studying", "English", "now"],
++        "correct_order": [0, 1, 2, 3],
++        "answer": "I am studying English",
++        "explanation": "现在进行时",
++    }
++    card = _render(room, data)
++    assert isinstance(card, ExerciseCard)
++    # 词池含干扰词共 5 个
++    assert len(card._pool_chips) == 5
++
++
++def test_story_renders(room):
++    """story 题型应渲染为 ExerciseCard"""
++    from shadowtalk.ui.widgets.english_room import ExerciseCard
++    data = {
++        "type": "story",
++        "word": "decision",
++        "story_text": "Tom found a wallet on the street. He looked inside and saw a lot of cash.",
++        "choices": ["He kept the money",
++                    "He took it to the police",
++                    "He threw it away",
++                    "He ignored it"],
++        "answer": "He took it to the police",
++        "explanation": "拾金不昧是正确行为",
++    }
++    card = _render(room, data)
++    assert isinstance(card, ExerciseCard)
++    assert len(card._story_buttons) == 4
++
++
++# ── 答题正确 / 错误测试 ──
++def test_cloze_correct_answer_records_stats(room, monkeypatch):
++    """选词填空答对：record_exercise 应被调用且 correct=True"""
++    recorded = []
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.record_exercise",
++        lambda *a, **k: recorded.append(a))
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.upsert_progress",
++        lambda *a, **k: None)
++
++    data = {
++        "type": "cloze",
++        "word": "perseverance",
++        "prompt": "She showed great ____.",
++        "options": ["perseverance", "ignorance", "fragility", "arrogance"],
++        "answer": "perseverance",
++        "explanation": "毅力",
++    }
++    card = _render(room, data)
++    # 模拟点击正确选项
++    card._on_cloze_click("perseverance", card._cloze_buttons[0])
++    card._on_check_answer()
++
++    assert len(recorded) == 1
++    # record_exercise(friend_id, word, type, correct, attempts, time_used, is_bonus)
++    assert recorded[0][1] == "perseverance"
++    assert recorded[0][2] == "cloze"
++    assert recorded[0][3] is True   # correct
++
++
++def test_cloze_wrong_answer_records_stats(room, monkeypatch):
++    """选词填空答错：record_exercise 应被调用且 correct=False"""
++    recorded = []
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.record_exercise",
++        lambda *a, **k: recorded.append(a))
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.upsert_progress",
++        lambda *a, **k: None)
++
++    data = {
++        "type": "cloze",
++        "word": "perseverance",
++        "prompt": "She showed great ____.",
++        "options": ["perseverance", "ignorance", "fragility", "arrogance"],
++        "answer": "perseverance",
++        "explanation": "毅力",
++    }
++    card = _render(room, data)
++    # 模拟点击错误选项
++    card._on_cloze_click("ignorance", card._cloze_buttons[1])
++    card._on_check_answer()
++
++    assert len(recorded) == 1
++    assert recorded[0][3] is False   # incorrect
++
++
++def test_sentence_build_correct_flow(room, monkeypatch):
++    """sentence_build 答对：按正确顺序点击词芯片"""
++    recorded = []
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.record_exercise",
++        lambda *a, **k: recorded.append(a))
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.upsert_progress",
++        lambda *a, **k: None)
++
++    data = {
++        "type": "sentence_build",
++        "word": "gives",
++        "words": ["She", "never", "gives", "up"],
++        "correct_order": [0, 1, 2, 3],
++        "answer": "She never gives up",
++        "explanation": "主语 + 副词 + 动词短语",
++    }
++    card = _render(room, data)
++    # 按正确顺序点击
++    for idx in [0, 1, 2, 3]:
++        card._on_pool_click(idx)
++    # 构建区句子应等于答案
++    assert card._get_user_answer() == "She never gives up"
++    card._on_check_answer()
++    assert len(recorded) == 1
++    assert recorded[0][3] is True
++
++
++def test_sentence_build_wrong_flow(room, monkeypatch):
++    """sentence_build 答错：乱序点击"""
++    recorded = []
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.record_exercise",
++        lambda *a, **k: recorded.append(a))
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.upsert_progress",
++        lambda *a, **k: None)
++
++    data = {
++        "type": "sentence_build",
++        "word": "gives",
++        "words": ["She", "never", "gives", "up"],
++        "correct_order": [0, 1, 2, 3],
++        "answer": "She never gives up",
++        "explanation": "主语 + 副词 + 动词短语",
++    }
++    card = _render(room, data)
++    # 错误顺序
++    for idx in [3, 2, 1, 0]:
++        card._on_pool_click(idx)
++    assert card._get_user_answer() == "up gives never She"
++    card._on_check_answer()
++    assert len(recorded) == 1
++    assert recorded[0][3] is False
++
++
++def test_translate_assemble_correct_flow(room, monkeypatch):
++    """translate_assemble 答对"""
++    recorded = []
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.record_exercise",
++        lambda *a, **k: recorded.append(a))
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.upsert_progress",
++        lambda *a, **k: None)
++
++    data = {
++        "type": "translate_assemble",
++        "word": "study",
++        "prompt": "我正在学习英语",
++        "words": ["I", "am", "studying", "English", "now"],
++        "correct_order": [0, 1, 2, 3],
++        "answer": "I am studying English",
++        "explanation": "现在进行时",
++    }
++    card = _render(room, data)
++    for idx in [0, 1, 2, 3]:
++        card._on_pool_click(idx)
++    assert card._get_user_answer() == "I am studying English"
++    card._on_check_answer()
++    assert len(recorded) == 1
++    assert recorded[0][3] is True
++
++
++def test_story_correct_flow(room, monkeypatch):
++    """story 答对"""
++    recorded = []
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.record_exercise",
++        lambda *a, **k: recorded.append(a))
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.upsert_progress",
++        lambda *a, **k: None)
++
++    data = {
++        "type": "story",
++        "word": "decision",
++        "story_text": "Tom found a wallet.",
++        "choices": ["He kept it", "He took it to the police"],
++        "answer": "He took it to the police",
++        "explanation": "拾金不昧",
++    }
++    card = _render(room, data)
++    card._on_story_click("He took it to the police")
++    card._on_check_answer()
++    assert len(recorded) == 1
++    assert recorded[0][3] is True
++
++
++# ── resume_exercise 回传测试 ──
++def test_resume_exercise_called_after_correct_answer(room, monkeypatch):
++    """答对后应调用 ai_worker.resume_exercise"""
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.record_exercise",
++        lambda *a, **k: None)
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.upsert_progress",
++        lambda *a, **k: None)
++
++    worker = _FakeWorker()
++    room.ai_worker = worker
++
++    data = {
++        "type": "cloze",
++        "word": "test",
++        "prompt": "____",
++        "options": ["test", "a", "b", "c"],
++        "answer": "test",
++        "explanation": "test",
++    }
++    card = _render(room, data)
++    card._on_cloze_click("test", card._cloze_buttons[0])
++    card._on_check_answer()
++
++    assert len(worker.resumed) == 1
++    result = json.loads(worker.resumed[0])
++    assert result["correct"] is True
++    assert result["skipped"] is False
++    assert result["exercise_type"] == "cloze"
++
++
++def test_resume_exercise_called_after_wrong_answer(room, monkeypatch):
++    """答错后也应调用 ai_worker.resume_exercise"""
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.record_exercise",
++        lambda *a, **k: None)
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.upsert_progress",
++        lambda *a, **k: None)
++
++    worker = _FakeWorker()
++    room.ai_worker = worker
++
++    data = {
++        "type": "cloze",
++        "word": "test",
++        "prompt": "____",
++        "options": ["test", "a", "b", "c"],
++        "answer": "test",
++        "explanation": "test",
++    }
++    card = _render(room, data)
++    card._on_cloze_click("a", card._cloze_buttons[1])
++    card._on_check_answer()
++
++    assert len(worker.resumed) == 1
++    result = json.loads(worker.resumed[0])
++    assert result["correct"] is False
++    assert result["user_answer"] == "a"
++    assert result["correct_answer"] == "test"
++
++
++# ── 跳过测试 ──
++def test_skip_calls_resume_exercise_with_skipped(room, monkeypatch):
++    """跳过应调用 resume_exercise 且 skipped=True"""
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.record_exercise",
++        lambda *a, **k: None)
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.upsert_progress",
++        lambda *a, **k: None)
++
++    worker = _FakeWorker()
++    room.ai_worker = worker
++
++    data = {
++        "type": "cloze",
++        "word": "test",
++        "prompt": "____",
++        "options": ["test", "a", "b", "c"],
++        "answer": "test",
++        "explanation": "test",
++    }
++    card = _render(room, data)
++    card._on_skip()
++
++    assert len(worker.resumed) == 1
++    result = json.loads(worker.resumed[0])
++    assert result["skipped"] is True
++    assert result["correct"] is False
++    assert result["attempts"] == 0
++
++
++# ── 输入栏重新启用测试 ──
++def test_input_re_enabled_after_answer(room, monkeypatch):
++    """答完题后输入栏应重新启用"""
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.record_exercise",
++        lambda *a, **k: None)
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.upsert_progress",
++        lambda *a, **k: None)
++
++    data = {
++        "type": "cloze",
++        "word": "test",
++        "prompt": "____",
++        "options": ["test", "a", "b", "c"],
++        "answer": "test",
++        "explanation": "test",
++    }
++    _render(room, data)
++    assert room.input_edit.isEnabled() is False
++    card = room._current_card
++    card._on_cloze_click("test", card._cloze_buttons[0])
++    card._on_check_answer()
++    assert room.input_edit.isEnabled() is True
++    assert room.send_btn.isEnabled() is True
++
++
++def test_input_re_enabled_after_skip(room, monkeypatch):
++    """跳过后输入栏应重新启用"""
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.record_exercise",
++        lambda *a, **k: None)
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.upsert_progress",
++        lambda *a, **k: None)
++
++    data = {
++        "type": "cloze",
++        "word": "test",
++        "prompt": "____",
++        "options": ["test", "a", "b", "c"],
++        "answer": "test",
++        "explanation": "test",
++    }
++    _render(room, data)
++    assert room.input_edit.isEnabled() is False
++    card = room._current_card
++    card._on_skip()
++    assert room.input_edit.isEnabled() is True
++    assert room.send_btn.isEnabled() is True
++
++
++# ── 重复答题保护 ──
++def test_double_answer_is_ignored(room, monkeypatch):
++    """同一张卡片答两次：第二次应被忽略"""
++    recorded = []
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.record_exercise",
++        lambda *a, **k: recorded.append(a))
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.upsert_progress",
++        lambda *a, **k: None)
++
++    data = {
++        "type": "cloze",
++        "word": "test",
++        "prompt": "____",
++        "options": ["test", "a", "b", "c"],
++        "answer": "test",
++        "explanation": "test",
++    }
++    card = _render(room, data)
++    card._on_cloze_click("test", card._cloze_buttons[0])
++    card._on_check_answer()
++    card._on_check_answer()   # 第二次应被忽略
++    assert len(recorded) == 1
++
++
++# ── 反馈显示测试 ──
++def test_feedback_shown_after_correct(room, monkeypatch):
++    """答对后应显示绿色反馈"""
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.record_exercise",
++        lambda *a, **k: None)
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.upsert_progress",
++        lambda *a, **k: None)
++
++    data = {
++        "type": "cloze",
++        "word": "test",
++        "prompt": "____",
++        "options": ["test", "a", "b", "c"],
++        "answer": "test",
++        "explanation": "很棒！",
++    }
++    card = _render(room, data)
++    card._on_cloze_click("test", card._cloze_buttons[0])
++    card._on_check_answer()
++    # 卡片中应出现含"正确"的 QLabel
++    found = False
++    for i in range(card._layout.count()):
++        w = card._layout.itemAt(i).widget()
++        if isinstance(w, QLabel) and "正确" in w.text():
++            found = True
++            break
++    assert found, "答对后应显示绿色反馈"
++
++
++def test_feedback_shown_after_wrong(room, monkeypatch):
++    """答错后应显示红色反馈含正确答案"""
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.record_exercise",
++        lambda *a, **k: None)
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.upsert_progress",
++        lambda *a, **k: None)
++
++    data = {
++        "type": "cloze",
++        "word": "test",
++        "prompt": "____",
++        "options": ["test", "a", "b", "c"],
++        "answer": "test",
++        "explanation": "加油！",
++    }
++    card = _render(room, data)
++    card._on_cloze_click("a", card._cloze_buttons[1])
++    card._on_check_answer()
++    found = False
++    for i in range(card._layout.count()):
++        w = card._layout.itemAt(i).widget()
++        if isinstance(w, QLabel) and "错误" in w.text() and "test" in w.text():
++            found = True
++            break
++    assert found, "答错后应显示红色反馈含正确答案"

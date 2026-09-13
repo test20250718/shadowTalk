@@ -1,0 +1,136 @@
+diff --git a/aiworkspace18/shadowtalk/core/ai_client.py b/aiworkspace18/shadowtalk/core/ai_client.py
+index c73a1b1..0b76bf8 100644
+--- a/aiworkspace18/shadowtalk/core/ai_client.py
++++ b/aiworkspace18/shadowtalk/core/ai_client.py
+@@ -1,15 +1,17 @@
+ # shadowtalk/core/ai_client.py
+ import json
+ 
+ import openai
+ 
++from shadowtalk.core.english_exercise import PRESENT_EXERCISE_TOOL
++
+ # 空回复兜底文案（模型返回空 content 且重试仍空时使用，
+ # 避免空气泡落库显示、并污染后续上下文）
+ _EMPTY_REPLY_FALLBACK = "（我刚才没反应过来，请再说一遍。）"
+ 
+ 
+ def _sanitize_messages(messages: list[dict]) -> list[dict]:
+     """发送前清洗：去掉内部 layer 键；剔除空 content 的 assistant 历史。
+ 
+     历史 bug 落库的空 assistant 消息会让部分模型/网关在后续请求中
+     持续返回空内容（用户报告：秘书角色从此闭嘴），必须在发送前滤除。
+@@ -47,37 +49,40 @@ class AIClient:
+         return response.choices[0].message.content or ""
+ 
+     def chat_with_tools(self, messages: list[dict],
+                         tool_runner, max_tool_calls: int = 15) -> str:
+         """
+         带工具调用的多轮对话。
+         tool_runner: Callable[[code: str, reason: str], str] 执行代码返回文本结果
+         模型不支持 tools 时回退纯文本 chat()
+         """
+         clean_messages = _sanitize_messages(messages)
+-        tools = [{
+-            "type": "function",
+-            "function": {
+-                "name": "run_python",
+-                "description": "在用户指定的工作目录下执行 Python 代码（可读写文件、处理数据、生成文档）。",
+-                "parameters": {
+-                    "type": "object",
+-                    "properties": {
+-                        "code": {"type": "string",
+-                                 "description": "要执行的 Python 代码"},
+-                        "reason": {"type": "string",
+-                                   "description": "执行目的说明（展示给用户）"},
++        tools = [
++            {
++                "type": "function",
++                "function": {
++                    "name": "run_python",
++                    "description": "在用户指定的工作目录下执行 Python 代码（可读写文件、处理数据、生成文档）。",
++                    "parameters": {
++                        "type": "object",
++                        "properties": {
++                            "code": {"type": "string",
++                                     "description": "要执行的 Python 代码"},
++                            "reason": {"type": "string",
++                                       "description": "执行目的说明（展示给用户）"},
++                        },
++                        "required": ["code", "reason"],
+                     },
+-                    "required": ["code", "reason"],
+                 },
+             },
+-        }]
++            PRESENT_EXERCISE_TOOL,
++        ]
+ 
+         for _ in range(max_tool_calls):
+             try:
+                 response = self.client.chat.completions.create(
+                     model=self.model,
+                     messages=clean_messages,
+                     temperature=self.temperature,
+                     max_tokens=self.max_tokens,
+                     tools=tools,
+                 )
+@@ -122,19 +127,25 @@ class AIClient:
+                     args = json.loads(tc.function.arguments or "{}")
+                 except json.JSONDecodeError:
+                     args = {}
+                 if name == "run_python":
+                     code = args.get("code", "")
+                     reason = args.get("reason", "")
+                     try:
+                         result_text = tool_runner(code, reason)
+                     except Exception as e:
+                         result_text = f"工具执行异常: {e}"
++                elif name == "present_exercise":
++                    # present_exercise 不由 python_executor 执行，
++                    # 而是由 AIWorker._run_tool 拦截并挂起等待用户交互。
++                    # 此处把工具参数作为 code 传给 tool_runner。
++                    exercise_json = args if isinstance(args, str) else json.dumps(args)
++                    result_text = tool_runner(exercise_json, f"出题: {args.get('word', '')}")
+                 else:
+                     result_text = f"未知工具: {name}"
+                 clean_messages.append({
+                     "role": "tool",
+                     "tool_call_id": tc.id,
+                     "content": result_text,
+                 })
+ 
+         return "我不小心掉线了，请任意回复，我马上回来。"
+diff --git a/aiworkspace18/tests/test_ai_client.py b/aiworkspace18/tests/test_ai_client.py
+index 9afabe9..a6ae7e7 100644
+--- a/aiworkspace18/tests/test_ai_client.py
++++ b/aiworkspace18/tests/test_ai_client.py
+@@ -169,20 +169,28 @@ def test_chat_with_tools_empty_everything_returns_fallback():
+ 
+         client = AIClient(base_url="https://t", api_key="k", model="m")
+         result = client.chat_with_tools(
+             [{"role": "user", "content": "在吗"}],
+             tool_runner=lambda c, r: "out"
+         )
+     assert isinstance(result, str)
+     assert result.strip(), "兜底文案不得为空"
+ 
+ 
++def test_present_exercise_in_tools():
++    """present_exercise 工具应出现在 chat_with_tools 的工具列表中"""
++    import shadowtalk.core.ai_client as ai_mod
++    src = open(ai_mod.__file__, encoding="utf-8").read()
++    assert "present_exercise" in src
++    assert "PRESENT_EXERCISE_TOOL" in src
++
++
+ def test_chat_with_tools_filters_empty_assistant_history():
+     """已落库的空 assistant 消息不得发给 API（毒害后续请求致持续空回复）"""
+     final_msg = MagicMock()
+     final_msg.content = "好的"
+     final_msg.tool_calls = None
+     resp = MagicMock()
+     resp.choices = [MagicMock(message=final_msg)]
+ 
+     with patch("openai.OpenAI") as MockOpenAI:
+         mock_instance = MockOpenAI.return_value

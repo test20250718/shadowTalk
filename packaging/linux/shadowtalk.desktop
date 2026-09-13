@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=ShadowTalk 影聊
+GenericName=AI Chat
+Comment=本机优先的 AI 聊天（消息仅保存在本机）
+Comment[zh_CN]=本机优先的 AI 聊天（消息仅保存在本机）
+Exec=/opt/shadowtalk/ShadowTalk
+Terminal=false
+Categories=Network;InstantMessaging;Chat;
+StartupNotify=true

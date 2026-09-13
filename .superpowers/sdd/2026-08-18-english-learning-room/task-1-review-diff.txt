@@ -1,0 +1,159 @@
+diff --git a/aiworkspace18/shadowtalk/data/database.py b/aiworkspace18/shadowtalk/data/database.py
+index 6d41cd5..a44ec33 100644
+--- a/aiworkspace18/shadowtalk/data/database.py
++++ b/aiworkspace18/shadowtalk/data/database.py
+@@ -42,20 +42,32 @@ _READING_SCENE_PROMPT = (
+     "【当前场景：阅读室】你现在和对方并肩坐在阅读室里一起读书——"
+     "注意这是阅读室，不是咖啡馆；即使你们之前在咖啡馆或音乐室聊过，"
+     "此刻也已经换到阅读室了。你们在读同一本书：用户翻到哪里，"
+     "你只能通过界面给出的当前页附近正文了解剧情，看不到更多。"
+     "安静陪读：用户不提问你就安静陪着，不主动说话、不剧透、不点评。"
+     "用户发问时，像朋友一样聊书里的内容，回答口语化。"
+     "用户问到给定正文之外的内容时，如实说你还没读到那里。"
+     "不使用列表、标题或长篇大论。"
+ )
+ 
++# 英语教室场景人设：一对一英语教师，按词库系统推进
++_ENGLISH_SCENE_PROMPT = """你是一位专业的英语一对一教师。
++
++教学原则：
++- 系统性：按词库范围有计划地推进，确保覆盖核心词汇
++- 间隔重复：根据答题记录，在快要遗忘时安排复习
++- 难度递进：先词义辨识，再填空，再组句，最后翻译拼装
++- 自由对话是语境补充：从上下文了解学生兴趣和表达水平
++- 用 present_exercise 工具出题，等学生答题后再讲解
++- 讲解简洁有力，1-3 句话
++- 偶尔可以超纲出 1-2 道拓展题（标注为 bonus），但不影响进度统计"""
++
+ SCHEMA = """
+ CREATE TABLE IF NOT EXISTS friends (
+     id INTEGER PRIMARY KEY AUTOINCREMENT,
+     name TEXT NOT NULL,
+     remark TEXT DEFAULT '',
+     system_prompt TEXT DEFAULT '',
+     ai_role TEXT DEFAULT '',
+     user_role TEXT DEFAULT '',
+     work_dir TEXT DEFAULT '',
+     avatar_path TEXT DEFAULT '',
+@@ -121,20 +133,47 @@ CREATE TABLE IF NOT EXISTS room_backgrounds (
+     FOREIGN KEY (friend_id) REFERENCES friends(id) ON DELETE CASCADE
+ );
+ 
+ CREATE TABLE IF NOT EXISTS reading_progress (
+     friend_id INTEGER NOT NULL,
+     book_path TEXT NOT NULL,
+     page INTEGER NOT NULL DEFAULT 1,
+     update_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+     PRIMARY KEY (friend_id, book_path)
+ );
++
++CREATE TABLE IF NOT EXISTS english_exercise_stats (
++    id INTEGER PRIMARY KEY AUTOINCREMENT,
++    friend_id INTEGER NOT NULL,
++    word TEXT NOT NULL,
++    exercise_type TEXT NOT NULL,
++    correct BOOLEAN NOT NULL,
++    attempts INTEGER DEFAULT 1,
++    time_used REAL,
++    is_bonus BOOLEAN DEFAULT 0,
++    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
++    FOREIGN KEY (friend_id) REFERENCES friends(id) ON DELETE CASCADE
++);
++
++CREATE TABLE IF NOT EXISTS english_progress (
++    id INTEGER PRIMARY KEY AUTOINCREMENT,
++    friend_id INTEGER NOT NULL,
++    word_range TEXT NOT NULL,
++    word TEXT NOT NULL,
++    status TEXT NOT NULL,
++    review_at TEXT,
++    times_correct INTEGER DEFAULT 0,
++    times_wrong INTEGER DEFAULT 0,
++    last_exercise_at DATETIME,
++    UNIQUE(friend_id, word_range, word),
++    FOREIGN KEY (friend_id) REFERENCES friends(id) ON DELETE CASCADE
++);
+ """
+ 
+ 
+ class Database:
+     _conn = None
+     _write_lock = threading.Lock()
+ 
+     @classmethod
+     def get_connection(cls) -> sqlite3.Connection:
+         if cls._conn is None:
+@@ -186,20 +225,28 @@ class Database:
+         conn.execute("UPDATE rooms SET name='阅读室', scene_prompt=? "
+                      "WHERE key='reading'",
+                      (_READING_SCENE_PROMPT,))
+         conn.execute(
+             "INSERT OR IGNORE INTO rooms (key, name, scene_prompt) "
+             "VALUES ('reading', '阅读室', ?)",
+             (_READING_SCENE_PROMPT,),
+         )
+         conn.execute("UPDATE rooms SET scene_prompt=? WHERE key='reading'",
+                      (_READING_SCENE_PROMPT,))
++        # 英语教室：播种默认房间（随版本刷新场景人设）
++        conn.execute(
++            "INSERT OR IGNORE INTO rooms (key, name, scene_prompt) "
++            "VALUES ('english', '英语教室', ?)",
++            (_ENGLISH_SCENE_PROMPT,)
++        )
++        conn.execute("UPDATE rooms SET scene_prompt=? WHERE key='english'",
++                     (_ENGLISH_SCENE_PROMPT,))
+ 
+     @classmethod
+     @contextmanager
+     def transaction(cls):
+         conn = cls.get_connection()
+         with cls._write_lock:
+             conn.execute("BEGIN")
+             try:
+                 yield conn
+                 conn.execute("COMMIT")
+diff --git a/aiworkspace18/tests/test_database.py b/aiworkspace18/tests/test_database.py
+index 4cd9c8d..e79f072 100644
+--- a/aiworkspace18/tests/test_database.py
++++ b/aiworkspace18/tests/test_database.py
+@@ -108,20 +108,40 @@ def test_migrate_adds_work_dir_to_old_friends_table():
+     cols = {row[1] for row in conn.execute("PRAGMA table_info(friends)")}
+     assert "work_dir" in cols
+ 
+     conn.execute("INSERT INTO friends (name) VALUES (?)", ("旧库好友",))
+     row = conn.execute(
+         "SELECT work_dir FROM friends WHERE name=?", ("旧库好友",)
+     ).fetchone()
+     assert row is not None
+     assert row["work_dir"] == ""
+ 
++def test_english_tables_exist():
++    """英语教室答题记录表和进度表应在 _migrate 后存在"""
++    from shadowtalk.data.database import Database
++    conn = Database.get_connection()
++    tables = {row[0] for row in conn.execute(
++        "SELECT name FROM sqlite_master WHERE type='table'")}
++    assert "english_exercise_stats" in tables
++    assert "english_progress" in tables
++
++
++def test_english_room_seeded():
++    """英语教室房间应在 _migrate 后存在"""
++    from shadowtalk.data.database import Database
++    conn = Database.get_connection()
++    row = conn.execute(
++        "SELECT name FROM rooms WHERE key='english'").fetchone()
++    assert row is not None
++    assert row["name"] == "英语教室"
++
++
+ def test_db_path_under_base_dir(monkeypatch):
+     """DB 文件应位于基目录下（打包后 = exe 目录）"""
+     import sys
+     import importlib
+     import shadowtalk.data.database as orig_module
+     import shadowtalk.data as data_pkg
+ 
+     # conftest 的 autouse fixture 会把 DB_PATH 替换为临时库路径；
+     # 本测试验证的是模块导入时的默认落位（不受 fixture 补丁影响），
+     # 因此临时移除 sys.modules 缓存重新导入，随后恢复原模块。

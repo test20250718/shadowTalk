@@ -1,0 +1,2833 @@
+diff --git a/aiworkspace18/shadowtalk/core/ai_client.py b/aiworkspace18/shadowtalk/core/ai_client.py
+index c73a1b1..0b76bf8 100644
+--- a/aiworkspace18/shadowtalk/core/ai_client.py
++++ b/aiworkspace18/shadowtalk/core/ai_client.py
+@@ -1,15 +1,17 @@
+ # shadowtalk/core/ai_client.py
+ import json
+ 
+ import openai
+ 
++from shadowtalk.core.english_exercise import PRESENT_EXERCISE_TOOL
++
+ # 空回复兜底文案（模型返回空 content 且重试仍空时使用，
+ # 避免空气泡落库显示、并污染后续上下文）
+ _EMPTY_REPLY_FALLBACK = "（我刚才没反应过来，请再说一遍。）"
+ 
+ 
+ def _sanitize_messages(messages: list[dict]) -> list[dict]:
+     """发送前清洗：去掉内部 layer 键；剔除空 content 的 assistant 历史。
+ 
+     历史 bug 落库的空 assistant 消息会让部分模型/网关在后续请求中
+     持续返回空内容（用户报告：秘书角色从此闭嘴），必须在发送前滤除。
+@@ -47,37 +49,40 @@ class AIClient:
+         return response.choices[0].message.content or ""
+ 
+     def chat_with_tools(self, messages: list[dict],
+                         tool_runner, max_tool_calls: int = 15) -> str:
+         """
+         带工具调用的多轮对话。
+         tool_runner: Callable[[code: str, reason: str], str] 执行代码返回文本结果
+         模型不支持 tools 时回退纯文本 chat()
+         """
+         clean_messages = _sanitize_messages(messages)
+-        tools = [{
+-            "type": "function",
+-            "function": {
+-                "name": "run_python",
+-                "description": "在用户指定的工作目录下执行 Python 代码（可读写文件、处理数据、生成文档）。",
+-                "parameters": {
+-                    "type": "object",
+-                    "properties": {
+-                        "code": {"type": "string",
+-                                 "description": "要执行的 Python 代码"},
+-                        "reason": {"type": "string",
+-                                   "description": "执行目的说明（展示给用户）"},
++        tools = [
++            {
++                "type": "function",
++                "function": {
++                    "name": "run_python",
++                    "description": "在用户指定的工作目录下执行 Python 代码（可读写文件、处理数据、生成文档）。",
++                    "parameters": {
++                        "type": "object",
++                        "properties": {
++                            "code": {"type": "string",
++                                     "description": "要执行的 Python 代码"},
++                            "reason": {"type": "string",
++                                       "description": "执行目的说明（展示给用户）"},
++                        },
++                        "required": ["code", "reason"],
+                     },
+-                    "required": ["code", "reason"],
+                 },
+             },
+-        }]
++            PRESENT_EXERCISE_TOOL,
++        ]
+ 
+         for _ in range(max_tool_calls):
+             try:
+                 response = self.client.chat.completions.create(
+                     model=self.model,
+                     messages=clean_messages,
+                     temperature=self.temperature,
+                     max_tokens=self.max_tokens,
+                     tools=tools,
+                 )
+@@ -122,19 +127,25 @@ class AIClient:
+                     args = json.loads(tc.function.arguments or "{}")
+                 except json.JSONDecodeError:
+                     args = {}
+                 if name == "run_python":
+                     code = args.get("code", "")
+                     reason = args.get("reason", "")
+                     try:
+                         result_text = tool_runner(code, reason)
+                     except Exception as e:
+                         result_text = f"工具执行异常: {e}"
++                elif name == "present_exercise":
++                    # present_exercise 不由 python_executor 执行，
++                    # 而是由 AIWorker._run_tool 拦截并挂起等待用户交互。
++                    # 此处把工具参数作为 code 传给 tool_runner。
++                    exercise_json = args if isinstance(args, str) else json.dumps(args)
++                    result_text = tool_runner(exercise_json, f"出题: {args.get('word', '')}")
+                 else:
+                     result_text = f"未知工具: {name}"
+                 clean_messages.append({
+                     "role": "tool",
+                     "tool_call_id": tc.id,
+                     "content": result_text,
+                 })
+ 
+         return "我不小心掉线了，请任意回复，我马上回来。"
+diff --git a/aiworkspace18/shadowtalk/core/english_exercise.py b/aiworkspace18/shadowtalk/core/english_exercise.py
+new file mode 100644
+index 0000000..dfa87e3
+--- /dev/null
++++ b/aiworkspace18/shadowtalk/core/english_exercise.py
+@@ -0,0 +1,275 @@
++# shadowtalk/core/english_exercise.py
++import datetime
++import logging
++
++from shadowtalk.data.database import Database
++
++logger = logging.getLogger(__name__)
++
++# 练习类型枚举（与 present_exercise 工具的 type 枚举一致）
++EXERCISE_TYPES = ("sentence_build", "cloze", "match", "translate_assemble", "story")
++
++# 复习间隔（天）：按连续答错次数递进（间隔重复算法）
++# 用户报告：错一次就当天反复刷太密 —— 改为 1/3/7 天递进
++REVIEW_INTERVALS = {1: 1, 2: 3, 3: 7}
++
++# present_exercise 工具定义：AI 用来给学生出题
++PRESENT_EXERCISE_TOOL = {
++    "type": "function",
++    "function": {
++        "name": "present_exercise",
++        "description": "给用户出一道英语练习题。当用户进入练习模式、答完上一题继续、"
++                       "或你判断需要巩固某个知识点时调用。",
++        "parameters": {
++            "type": "object",
++            "properties": {
++                "type": {
++                    "type": "string",
++                    "enum": ["sentence_build", "cloze", "match", "translate_assemble", "story"],
++                },
++                "word": {"type": "string"},
++                "prompt": {"type": "string"},
++                "words": {"type": "array", "items": {"type": "string"}},
++                "correct_order": {"type": "array", "items": {"type": "integer"}},
++                "options": {"type": "array", "items": {"type": "string"}},
++                "answer": {"type": "string"},
++                "pairs": {"type": "object"},
++                "time_limit": {"type": "integer"},
++                "story_text": {"type": "string"},
++                "choices": {"type": "array", "items": {"type": "string"}},
++                "explanation": {"type": "string"},
++            },
++            "required": ["type", "word", "answer", "explanation"],
++        },
++    },
++}
++
++
++def record_exercise(friend_id, word, exercise_type, correct, attempts=1,
++                    time_used=0.0, is_bonus=False):
++    """记录一次答题结果到 english_exercise_stats 表。
++
++    每次答题都追加一行（不做更新），便于后续统计连胜、正确率等。
++    """
++    with Database.transaction() as conn:
++        conn.execute(
++            "INSERT INTO english_exercise_stats "
++            "(friend_id, word, exercise_type, correct, attempts, time_used, is_bonus) "
++            "VALUES (?, ?, ?, ?, ?, ?, ?)",
++            (friend_id, word, exercise_type, int(bool(correct)), attempts,
++             time_used, int(bool(is_bonus)))
++        )
++    logger.debug("record_exercise: friend=%d word=%s type=%s correct=%s",
++                 friend_id, word, exercise_type, correct)
++
++
++def upsert_progress(friend_id, word_range, word, correct):
++    """更新学习进度：不存在则新建，存在则累加对/错次数并可能触发复习调度。
++
++    返回当前行字典（含 status、times_correct、times_wrong、review_at）。
++    """
++    conn = Database.get_connection()
++    row = conn.execute(
++        "SELECT * FROM english_progress "
++        "WHERE friend_id=? AND word_range=? AND word=?",
++        (friend_id, word_range, word)
++    ).fetchone()
++
++    now = datetime.datetime.now()
++
++    if row is None:
++        # 首次遇到这个词：新建记录，初始状态为 learning
++        times_correct = 1 if correct else 0
++        times_wrong = 0 if correct else 1
++        status = "learning"
++        review_at = None
++        conn.execute(
++            "INSERT INTO english_progress "
++            "(friend_id, word_range, word, status, review_at, times_correct, "
++            "times_wrong, last_exercise_at) "
++            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
++            (friend_id, word_range, word, status, review_at,
++             times_correct, times_wrong, now.isoformat())
++        )
++    else:
++        # 已有记录：累加对/错次数
++        times_correct = row["times_correct"] + (1 if correct else 0)
++        times_wrong = row["times_wrong"] + (0 if correct else 1)
++
++        # 掌握条件：连续答对 3 次且从未答错
++        if times_correct >= 3 and times_wrong == 0:
++            status = "mastered"
++            review_at = None
++        else:
++            status = "learning"
++            # 答错了：按连续答错次数安排复习时间（间隔重复）
++            if not correct:
++                # 取当前连续答错次数（这里用总错次数近似，因为每次答错都重排复习）
++                wrong_streak = times_wrong
++                interval = REVIEW_INTERVALS.get(min(wrong_streak, 3), 7)
++                review_at = (now + datetime.timedelta(days=interval)).isoformat()
++            else:
++                review_at = None
++
++        conn.execute(
++            "UPDATE english_progress SET "
++            "status=?, times_correct=?, times_wrong=?, review_at=?, "
++            "last_exercise_at=? "
++            "WHERE friend_id=? AND word_range=? AND word=?",
++            (status, times_correct, times_wrong, review_at,
++             now.isoformat(), friend_id, word_range, word)
++        )
++
++    # 返回当前行
++    conn = Database.get_connection()
++    new_row = conn.execute(
++        "SELECT * FROM english_progress "
++        "WHERE friend_id=? AND word_range=? AND word=?",
++        (friend_id, word_range, word)
++    ).fetchone()
++    return dict(new_row)
++
++
++def get_next_word(friend_id, word_range):
++    """按优先级选取下一个要练习的词。
++
++    优先级：到期的复习词 → 正在学的词 → 新词。
++    返回词字符串，没有可练的返回 None。
++    """
++    conn = Database.get_connection()
++    now = datetime.datetime.now().isoformat()
++
++    # 第一优先：review_at 已到期（含 status='review' 和 learning 但到期的）
++    row = conn.execute(
++        "SELECT word FROM english_progress "
++        "WHERE friend_id=? AND word_range=? AND review_at IS NOT NULL "
++        "AND review_at <= ? "
++        "ORDER BY review_at ASC LIMIT 1",
++        (friend_id, word_range, now)
++    ).fetchone()
++    if row:
++        return row["word"]
++
++    # 第二优先：status='learning' 的词
++    row = conn.execute(
++        "SELECT word FROM english_progress "
++        "WHERE friend_id=? AND word_range=? AND status='learning' "
++        "LIMIT 1",
++        (friend_id, word_range)
++    ).fetchone()
++    if row:
++        return row["word"]
++
++    # 第三优先：status='new' 的词
++    row = conn.execute(
++        "SELECT word FROM english_progress "
++        "WHERE friend_id=? AND word_range=? AND status='new' "
++        "LIMIT 1",
++        (friend_id, word_range)
++    ).fetchone()
++    if row:
++        return row["word"]
++
++    return None
++
++
++def get_stats(friend_id):
++    """统计当前好友的练习数据。
++
++    返回 dict：
++    - streak: 从最近一条往前数连续答对次数（不含 bonus 题）
++    - today_count: 今日答题数（不含 bonus 题）
++    - accuracy: 最近 50 次非 bonus 答题的正确率（百分比）
++    """
++    conn = Database.get_connection()
++
++    # 连胜：从最新往最旧遍历非 bonus 题，遇到答错就停
++    rows = conn.execute(
++        "SELECT correct FROM english_exercise_stats "
++        "WHERE friend_id=? AND is_bonus=0 "
++        "ORDER BY created_at DESC, id DESC",
++        (friend_id,)
++    ).fetchall()
++
++    streak = 0
++    for r in rows:
++        if r["correct"]:
++            streak += 1
++        else:
++            break
++
++    # 今日答题数（非 bonus）
++    today = datetime.date.today().isoformat()
++    row = conn.execute(
++        "SELECT COUNT(*) AS cnt FROM english_exercise_stats "
++        "WHERE friend_id=? AND is_bonus=0 AND DATE(created_at)=?",
++        (friend_id, today)
++    ).fetchone()
++    today_count = row["cnt"] if row else 0
++
++    # 最近 50 次非 bonus 答题的正确率
++    rows = conn.execute(
++        "SELECT correct FROM english_exercise_stats "
++        "WHERE friend_id=? AND is_bonus=0 "
++        "ORDER BY created_at DESC, id DESC "
++        "LIMIT 50",
++        (friend_id,)
++    ).fetchall()
++
++    if rows:
++        correct_count = sum(1 for r in rows if r["correct"])
++        accuracy = round(correct_count * 100.0 / len(rows), 1)
++    else:
++        accuracy = 0.0
++
++    return {
++        "streak": streak,
++        "today_count": today_count,
++        "accuracy": accuracy,
++    }
++
++
++# ── 场景 prompt 构建 ──
++
++_SCENE_PROMPT_TEMPLATE = """你是一位专业的英语一对一教师，正在使用 {word_range} 词库辅导学生。
++
++当前进度：已掌握 {mastered} 词，学习中 {learning} 词，待复习 {review_due} 词。
++
++教学原则：
++- 系统性：按词库范围有计划地推进，确保覆盖核心词汇
++- 间隔重复：根据答题记录，错过的词在 1/3/7 轮后重现
++- 难度递进：先词义辨识，再填空，再组句，最后翻译拼装
++- 自由对话是语境补充：从上下文了解学生兴趣和表达水平
++- 用 present_exercise 工具出题，等学生答题后再讲解
++- 讲解简洁有力，1-3 句话
++- 偶尔可以超纲出 1-2 道拓展题（标注为 bonus），但不影响进度统计"""
++
++
++def build_scene_prompt(friend_id: int, word_range: str) -> str:
++    """构建带词库范围和当前统计的场景 prompt。
++
++    查询 english_progress 表统计已掌握 / 学习中 / 待复习的词数，
++    注入到场景模板中，让 AI 始终知道自己教到哪了。
++    """
++    conn = Database.get_connection()
++    mastered = conn.execute(
++        "SELECT COUNT(*) FROM english_progress "
++        "WHERE friend_id=? AND word_range=? AND status='mastered'",
++        (friend_id, word_range)).fetchone()[0]
++    learning = conn.execute(
++        "SELECT COUNT(*) FROM english_progress "
++        "WHERE friend_id=? AND word_range=? AND status='learning'",
++        (friend_id, word_range)).fetchone()[0]
++    now = datetime.datetime.now().isoformat()
++    review_due = conn.execute(
++        "SELECT COUNT(*) FROM english_progress "
++        "WHERE friend_id=? AND word_range=? AND review_at IS NOT NULL "
++        "AND review_at <= ?",
++        (friend_id, word_range, now)).fetchone()[0]
++
++    return _SCENE_PROMPT_TEMPLATE.format(
++        word_range=word_range,
++        mastered=mastered,
++        learning=learning,
++        review_due=review_due,
++    )
+diff --git a/aiworkspace18/shadowtalk/data/database.py b/aiworkspace18/shadowtalk/data/database.py
+index 6d41cd5..a44ec33 100644
+--- a/aiworkspace18/shadowtalk/data/database.py
++++ b/aiworkspace18/shadowtalk/data/database.py
+@@ -42,20 +42,32 @@ _READING_SCENE_PROMPT = (
+     "【当前场景：阅读室】你现在和对方并肩坐在阅读室里一起读书——"
+     "注意这是阅读室，不是咖啡馆；即使你们之前在咖啡馆或音乐室聊过，"
+     "此刻也已经换到阅读室了。你们在读同一本书：用户翻到哪里，"
+     "你只能通过界面给出的当前页附近正文了解剧情，看不到更多。"
+     "安静陪读：用户不提问你就安静陪着，不主动说话、不剧透、不点评。"
+     "用户发问时，像朋友一样聊书里的内容，回答口语化。"
+     "用户问到给定正文之外的内容时，如实说你还没读到那里。"
+     "不使用列表、标题或长篇大论。"
+ )
+ 
++# 英语教室场景人设：一对一英语教师，按词库系统推进
++_ENGLISH_SCENE_PROMPT = """你是一位专业的英语一对一教师。
++
++教学原则：
++- 系统性：按词库范围有计划地推进，确保覆盖核心词汇
++- 间隔重复：根据答题记录，在快要遗忘时安排复习
++- 难度递进：先词义辨识，再填空，再组句，最后翻译拼装
++- 自由对话是语境补充：从上下文了解学生兴趣和表达水平
++- 用 present_exercise 工具出题，等学生答题后再讲解
++- 讲解简洁有力，1-3 句话
++- 偶尔可以超纲出 1-2 道拓展题（标注为 bonus），但不影响进度统计"""
++
+ SCHEMA = """
+ CREATE TABLE IF NOT EXISTS friends (
+     id INTEGER PRIMARY KEY AUTOINCREMENT,
+     name TEXT NOT NULL,
+     remark TEXT DEFAULT '',
+     system_prompt TEXT DEFAULT '',
+     ai_role TEXT DEFAULT '',
+     user_role TEXT DEFAULT '',
+     work_dir TEXT DEFAULT '',
+     avatar_path TEXT DEFAULT '',
+@@ -121,20 +133,47 @@ CREATE TABLE IF NOT EXISTS room_backgrounds (
+     FOREIGN KEY (friend_id) REFERENCES friends(id) ON DELETE CASCADE
+ );
+ 
+ CREATE TABLE IF NOT EXISTS reading_progress (
+     friend_id INTEGER NOT NULL,
+     book_path TEXT NOT NULL,
+     page INTEGER NOT NULL DEFAULT 1,
+     update_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+     PRIMARY KEY (friend_id, book_path)
+ );
++
++CREATE TABLE IF NOT EXISTS english_exercise_stats (
++    id INTEGER PRIMARY KEY AUTOINCREMENT,
++    friend_id INTEGER NOT NULL,
++    word TEXT NOT NULL,
++    exercise_type TEXT NOT NULL,
++    correct BOOLEAN NOT NULL,
++    attempts INTEGER DEFAULT 1,
++    time_used REAL,
++    is_bonus BOOLEAN DEFAULT 0,
++    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
++    FOREIGN KEY (friend_id) REFERENCES friends(id) ON DELETE CASCADE
++);
++
++CREATE TABLE IF NOT EXISTS english_progress (
++    id INTEGER PRIMARY KEY AUTOINCREMENT,
++    friend_id INTEGER NOT NULL,
++    word_range TEXT NOT NULL,
++    word TEXT NOT NULL,
++    status TEXT NOT NULL,
++    review_at TEXT,
++    times_correct INTEGER DEFAULT 0,
++    times_wrong INTEGER DEFAULT 0,
++    last_exercise_at DATETIME,
++    UNIQUE(friend_id, word_range, word),
++    FOREIGN KEY (friend_id) REFERENCES friends(id) ON DELETE CASCADE
++);
+ """
+ 
+ 
+ class Database:
+     _conn = None
+     _write_lock = threading.Lock()
+ 
+     @classmethod
+     def get_connection(cls) -> sqlite3.Connection:
+         if cls._conn is None:
+@@ -186,20 +225,28 @@ class Database:
+         conn.execute("UPDATE rooms SET name='阅读室', scene_prompt=? "
+                      "WHERE key='reading'",
+                      (_READING_SCENE_PROMPT,))
+         conn.execute(
+             "INSERT OR IGNORE INTO rooms (key, name, scene_prompt) "
+             "VALUES ('reading', '阅读室', ?)",
+             (_READING_SCENE_PROMPT,),
+         )
+         conn.execute("UPDATE rooms SET scene_prompt=? WHERE key='reading'",
+                      (_READING_SCENE_PROMPT,))
++        # 英语教室：播种默认房间（随版本刷新场景人设）
++        conn.execute(
++            "INSERT OR IGNORE INTO rooms (key, name, scene_prompt) "
++            "VALUES ('english', '英语教室', ?)",
++            (_ENGLISH_SCENE_PROMPT,)
++        )
++        conn.execute("UPDATE rooms SET scene_prompt=? WHERE key='english'",
++                     (_ENGLISH_SCENE_PROMPT,))
+ 
+     @classmethod
+     @contextmanager
+     def transaction(cls):
+         conn = cls.get_connection()
+         with cls._write_lock:
+             conn.execute("BEGIN")
+             try:
+                 yield conn
+                 conn.execute("COMMIT")
+diff --git a/aiworkspace18/shadowtalk/ui/main_window.py b/aiworkspace18/shadowtalk/ui/main_window.py
+index d4d2991..dcd588c 100644
+--- a/aiworkspace18/shadowtalk/ui/main_window.py
++++ b/aiworkspace18/shadowtalk/ui/main_window.py
+@@ -246,26 +246,27 @@ class MainWindow(QMainWindow):
+ 
+     def _on_open_room(self):
+         """沉浸式房间入口：选房间 → 选好友 → 打开全屏窗口"""
+         friends = FriendRepository.get_all()
+         if not friends:
+             self.status_bar.showMessage("还没有好友，先添加一位再邀请去房间", 6000)
+             return
+         from PySide6.QtWidgets import QInputDialog
+         room_key, ok = QInputDialog.getItem(
+             self, "选择房间", "去哪个房间？",
+-            ["☕ 咖啡馆", "🎵 音乐室", "📖 阅读室"], 0, False)
++            ["☕ 咖啡馆", "🎵 音乐室", "📖 阅读室", "🏫 英语教室"], 0, False)
+         if not ok:
+             return
+         key_map = {"☕ 咖啡馆": ("cafe", "请谁去喝咖啡？"),
+                    "🎵 音乐室": ("music", "请谁一起听歌？"),
+-                   "📖 阅读室": ("reading", "请谁一起读书？")}
++                   "📖 阅读室": ("reading", "请谁一起读书？"),
++                   "🏫 英语教室": ("english", "请谁一起学英语？")}
+         room_key_id, invite_title = key_map[room_key]
+         # 重名好友显示名追加 id 区分，避免按名匹配选错人
+         from collections import Counter
+         displays = [f["remark"] or f["name"] for f in friends]
+         dup = {n for n, c in Counter(displays).items() if c > 1}
+         items = []
+         display_to_id = {}
+         for f, disp in zip(friends, displays):
+             item = f"{disp}（{f['id']}）" if disp in dup else disp
+             items.append(item)
+@@ -275,20 +276,30 @@ class MainWindow(QMainWindow):
+         if not ok:
+             return
+         friend_id = display_to_id[name]
+         from shadowtalk.ui.widgets.room_window import RoomWindow
+         if room_key_id == "music":
+             from shadowtalk.ui.widgets.music_room import MusicRoomWindow
+             room = MusicRoomWindow(friend_id, parent=self)
+         elif room_key_id == "reading":
+             from shadowtalk.ui.widgets.reading_room import ReadingRoomWindow
+             room = ReadingRoomWindow(friend_id, parent=self)
++        elif room_key_id == "english":
++            from shadowtalk.ui.widgets.english_word_range_dialog import EnglishWordRangeDialog
++            from PySide6.QtWidgets import QDialog
++            dlg = EnglishWordRangeDialog(parent=self, has_progress=False)
++            if dlg.exec() != QDialog.Accepted:
++                return
++            word_range, start_mode = dlg.get_selected_range()
++            from shadowtalk.ui.widgets.english_room import EnglishRoomWindow
++            room = EnglishRoomWindow(friend_id, word_range=word_range,
++                                     start_mode=start_mode, parent=self)
+         else:
+             room = RoomWindow(friend_id, "cafe", parent=self)
+         # 离开房间 → 刷新主界面：当前好友的聊天区重载 + 会话列表预览更新
+         room.finished.connect(lambda: self._on_room_closed(friend_id))
+         room.show_in_screen()  # 铺满可用区域（排除任务栏，输入条不被挡）
+ 
+     def _on_room_closed(self, friend_id: int):
+         """咖啡馆里聊的消息直接落库，主界面需主动重载显示"""
+         if self.current_friend_id != friend_id:
+             return
+diff --git a/aiworkspace18/shadowtalk/ui/threads/ai_worker.py b/aiworkspace18/shadowtalk/ui/threads/ai_worker.py
+index c3efb40..4186368 100644
+--- a/aiworkspace18/shadowtalk/ui/threads/ai_worker.py
++++ b/aiworkspace18/shadowtalk/ui/threads/ai_worker.py
+@@ -1,48 +1,57 @@
+ # shadowtalk/ui/threads/ai_worker.py
++import json
+ import logging
+ import time
+ 
+ from PySide6.QtCore import QThread, Signal
+ 
+ from shadowtalk.config.settings import Settings
+ 
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+ class AIWorker(QThread):
+     finished = Signal(str)
+     failed = Signal(str)
+     approval_requested = Signal(str, list, str)  # (code, paths, reason)
+     activity = Signal(str)   # 工作过程文字（思考/执行工具/完成，供工作卡显示）
++    exercise_requested = Signal(str, str, str)   # (exercise_json, word_range, reason)
++    exercise_answered = Signal(str, str)         # (tool_call_id, result_json) — 预留，供未来使用
+ 
+     def __init__(self, friend_id, user_message, ai_client, messages: list,
+-                 work_dir: str = "", approval_answered=None):
++                 work_dir: str = "", approval_answered=None,
++                 word_range: str = ""):
+         """
+         Args:
+             friend_id: 好友 ID
+             user_message: 用户原始消息（用于日志）
+             ai_client: AI 客户端实例
+             messages: 已构建好的完整上下文（由 build_context 生成）
+             work_dir: 工作目录；目录外写入需用户审批
+             approval_answered: 审批结果信号（Signal(bool)），
+                                None 时目录外写入一律拒绝
++            word_range: 当前练习范围标记（如 NCE2-L1），随 exercise_requested 信号发出
+         """
+         super().__init__()
+         self.friend_id = friend_id
+         self.user_message = user_message
+         self.ai_client = ai_client
+         self.messages = messages
+         self.work_dir = work_dir
+         self._approval_answered = approval_answered
+         self._approved = False
++        # 练习挂起状态
++        self._word_range = word_range
++        self._exercise_loop = None
++        self._last_exercise_result = None
+         # 干活限额（用户可调）：单轮工具调用上限、单次执行超时秒数
+         self.max_tool_calls = Settings.get_int("max_tool_calls")
+         self.tool_timeout = Settings.get_int("tool_timeout")
+ 
+     def cancel(self):
+         """强制中断在途任务。
+ 
+         openai 同步调用无超时、工具执行也无超时，无法协作式取消，
+         只能 terminate()。terminate 后不会发出 finished/failed 信号，
+         由调用方（MainWindow._stop_current_worker）断开信号并保留引用。
+@@ -56,36 +65,59 @@ class AIWorker(QThread):
+             reply = self.ai_client.chat_with_tools(
+                 self.messages,
+                 tool_runner=self._run_tool,
+                 max_tool_calls=self.max_tool_calls,
+             )
+             self.finished.emit(reply)
+         except Exception as e:
+             self.failed.emit(str(e))
+ 
+     def _run_tool(self, code: str, reason: str) -> str:
+-        """执行工具代码；未配置工作目录时拒绝，目录外写需经 UI 审批。
++        """执行工具代码；present_exercise 挂起等待用户答题。
+ 
+-        前后发 activity 信号让工作卡显示当前步骤与耗时。
++        - present_exercise 工具：reason 以 "出题: " 开头且 code 是 JSON 对象字符串，
++          挂起线程发出 exercise_requested 信号，等 UI 渲染答题卡后由 resume_exercise 恢复。
++        - 其他工具：未配置工作目录时拒绝，目录外写需经 UI 审批。
+         """
++        # present_exercise 工具：挂起线程等待用户答题，不执行代码
++        # 检测方式：reason 以 "出题: " 开头且 code 是 JSON 对象字符串
++        if reason.startswith("出题: ") and code and code.strip().startswith("{"):
++            from PySide6.QtCore import QEventLoop
++            loop = QEventLoop()
++            self._exercise_loop = loop
++            self._last_exercise_result = None
++            self.exercise_requested.emit(code, self._word_range, reason)
++            loop.exec()  # 等待用户答题后 resume_exercise 调用 quit
++            self._exercise_loop = None
++            return self._last_exercise_result or json.dumps({
++                "correct": False, "user_answer": "", "correct_answer": "",
++                "attempts": 1, "time_used": 0, "exercise_type": "skip",
++                "skipped": True})
++
+         if not self.work_dir:
+             # 未配置工作目录：拒绝执行，避免写入当前进程目录
+             logger.warning("拒绝工具执行: 未配置工作目录")
+             return ("当前好友未配置工作目录。请在好友设置中添加工作目录，"
+                     "即可让我读写文件。")
+ 
+         self.activity.emit(f"执行工具：{reason or code[:20]}")
+         start = time.time()
+         result = self._execute_tool(code, reason)
+         self.activity.emit(f"工具完成（{time.time() - start:.1f} 秒），继续思考…")
+         return result
+ 
++    def resume_exercise(self, result_json: str) -> None:
++        """用户答题后恢复挂起的练习循环。由 UI 线程调用。"""
++        self._last_exercise_result = result_json
++        if self._exercise_loop is not None:
++            self._exercise_loop.quit()
++
+     def _execute_tool(self, code: str, reason: str) -> str:
+         """审批与执行（由 _run_tool 调用，activity 已在外层报告）"""
+         logger.info("执行工具: reason=%s", reason)
+ 
+         from shadowtalk.core.python_executor import (
+             run_with_approval, scan_write_paths,
+         )
+ 
+         outside_paths = scan_write_paths(code, self.work_dir)
+         # 目录内写入无需审批，直接执行
+diff --git a/aiworkspace18/shadowtalk/ui/widgets/english_room.py b/aiworkspace18/shadowtalk/ui/widgets/english_room.py
+new file mode 100644
+index 0000000..24a013e
+--- /dev/null
++++ b/aiworkspace18/shadowtalk/ui/widgets/english_room.py
+@@ -0,0 +1,674 @@
++# shadowtalk/ui/widgets/english_room.py
++"""沉浸式英语教室：左聊右练，AI 驱动练习卡片。
++
++复用 RoomWindow 骨架：左侧窄聊天区（280px）+ 右侧练习卡片面板。
++AI 通过 present_exercise 工具在右侧出题，用户答题后结果回传 AI。
++设计文档：docs/superpowers/specs/2026-08-18-english-learning-room-design.md
++"""
++import json
++import logging
++import random
++import time
++
++from PySide6.QtCore import Qt, Signal, QTimer
++from PySide6.QtWidgets import (
++    QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame, QScrollArea,
++    QWidget, QButtonGroup, QRadioButton, QLineEdit,
++)
++
++from shadowtalk.core.english_exercise import (
++    record_exercise, upsert_progress, get_stats,
++)
++from shadowtalk.ui.widgets.room_window import RoomBubble, RoomWindow
++
++logger = logging.getLogger(__name__)
++
++
++class ExerciseCard(QFrame):
++    """练习卡片：5 种题型渲染 + 答题回传。
++
++    题型分派在 _render() 中按 data["type"] 分发到 _render_<type>()。
++    每张卡片持有对 EnglishRoomWindow 的弱引用（self._window），
++    答完 / 跳过 时回调 window 的 _check_answer / _skip_exercise。
++    """
++
++    answered = Signal(str, dict)  # (tool_call_id, result_dict)
++
++    def __init__(self, exercise_data: dict, tool_call_id: str = "",
++                 window=None, parent=None):
++        super().__init__(parent)
++        self._data = exercise_data
++        self._tool_call_id = tool_call_id
++        self._window = window
++        self._start_time = time.time()
++        self._attempts = 0
++        self._answered = False
++        self._layout = QVBoxLayout(self)
++        self._layout.setContentsMargins(16, 16, 16, 16)
++        self._layout.setSpacing(8)
++        self.setStyleSheet("""
++            QFrame { background-color: rgba(255,255,255,235);
++                     border-radius: 16px; }
++            QLabel { color: #1F2430; background: transparent; }
++        """)
++        self._render()
++
++    # ── 题型分派 ──
++    def _render(self):
++        """按 type 字段分派到具体渲染方法"""
++        dispatch = {
++            "sentence_build": self._render_sentence_build,
++            "cloze": self._render_cloze,
++            "match": self._render_match,
++            "translate_assemble": self._render_translate_assemble,
++            "story": self._render_story,
++        }
++        renderer = dispatch.get(self._data.get("type"), self._render_unknown)
++        renderer()
++        self._add_action_buttons()
++
++    # ── 题型 1：拖拽组句（sentence_build）──
++    def _render_sentence_build(self):
++        """点击单词芯片组句：词池 → 构建区 → 词池"""
++        self._build_type = "sentence_build"
++        prompt = self._data.get("prompt", "请将下列单词排列成正确的句子：")
++        self._layout.addWidget(self._make_label(prompt, bold=True))
++
++        words = self._data.get("words", [])
++        correct_order = self._data.get("correct_order", list(range(len(words))))
++        # 预计算正确答案字符串（用于比对）
++        self._correct_sentence = " ".join(words[i] for i in correct_order)
++
++        # 构建顺序：记录用户点击的词索引
++        self._build_indices = []
++
++        # 词池区
++        self._layout.addWidget(self._make_label("单词池：", color="#666666"))
++        pool_wrap = QWidget()
++        pool_wrap.setStyleSheet("background: transparent;")
++        self._pool_layout = QHBoxLayout(pool_wrap)
++        self._pool_layout.setSpacing(6)
++        self._pool_layout.setContentsMargins(0, 0, 0, 0)
++        self._pool_layout.addStretch(1)
++        self._layout.addWidget(pool_wrap)
++
++        # 构建区
++        self._layout.addWidget(self._make_label("你的句子：", color="#666666"))
++        build_wrap = QWidget()
++        build_wrap.setStyleSheet("background: transparent;")
++        self._build_layout = QHBoxLayout(build_wrap)
++        self._build_layout.setSpacing(6)
++        self._build_layout.setContentsMargins(0, 0, 0, 0)
++        self._build_layout.addStretch(1)
++        self._layout.addWidget(build_wrap)
++
++        # 创建词芯片
++        self._pool_chips = {}   # idx -> QPushButton（在词池中）
++        self._build_chips = {}  # idx -> QPushButton（在构建区）
++        for i, word in enumerate(words):
++            btn = self._make_chip(word)
++            # 默认闭包陷阱：用默认参数绑定当前 i
++            btn.clicked.connect(lambda checked, idx=i: self._on_pool_click(idx))
++            self._pool_layout.insertWidget(self._pool_layout.count() - 1, btn)
++            self._pool_chips[i] = btn
++
++    def _on_pool_click(self, idx):
++        """词池芯片点击 → 移到构建区"""
++        if self._answered or idx not in self._pool_chips:
++            return
++        btn = self._pool_chips.pop(idx)
++        self._pool_layout.removeWidget(btn)
++        btn.hide()
++        self._build_indices.append(idx)
++        new_btn = self._make_chip(btn.text())
++        new_btn.clicked.connect(lambda checked, i=idx: self._on_build_click(i))
++        self._build_layout.insertWidget(self._build_layout.count() - 1, new_btn)
++        self._build_chips[idx] = new_btn
++
++    def _on_build_click(self, idx):
++        """构建区芯片点击 → 退回词池"""
++        if self._answered or idx not in self._build_chips:
++            return
++        btn = self._build_chips.pop(idx)
++        self._build_layout.removeWidget(btn)
++        btn.hide()
++        self._build_indices.remove(idx)
++        new_btn = self._make_chip(btn.text())
++        new_btn.clicked.connect(lambda checked, i=idx: self._on_pool_click(i))
++        self._pool_layout.insertWidget(self._pool_layout.count() - 1, new_btn)
++        self._pool_chips[idx] = new_btn
++
++    def _get_sentence(self):
++        """获取当前构建区的句子"""
++        words = self._data.get("words", [])
++        return " ".join(words[i] for i in self._build_indices)
++
++    # ── 题型 2：选词填空（cloze）──
++    def _render_cloze(self):
++        """显示含空白的句子 + 4 个选项按钮"""
++        self._build_type = "cloze"
++        prompt = self._data.get("prompt", "")
++        # 把 ____ 渲染成可见空白
++        display = prompt.replace("____", "______")
++        self._layout.addWidget(self._make_label(display, bold=False))
++
++        options = self._data.get("options", [])
++        self._selected_option = None
++
++        opts_wrap = QWidget()
++        opts_wrap.setStyleSheet("background: transparent;")
++        opts_layout = QHBoxLayout(opts_wrap)
++        opts_layout.setSpacing(8)
++        opts_layout.setContentsMargins(0, 0, 0, 0)
++        self._cloze_buttons = []
++        for opt in options:
++            btn = self._make_chip(opt)
++            btn.clicked.connect(lambda checked, o=opt, b=btn: self._on_cloze_click(o, b))
++            opts_layout.addWidget(btn)
++            self._cloze_buttons.append(btn)
++        self._layout.addWidget(opts_wrap)
++
++    def _on_cloze_click(self, option, btn):
++        """选中一个选项：高亮当前、取消其他"""
++        if self._answered:
++            return
++        self._selected_option = option
++        for b in self._cloze_buttons:
++            b.setStyleSheet(self._chip_style())
++        btn.setStyleSheet(self._chip_selected_style())
++
++    # ── ── 题型 3：闪电配对（match）──
++    def _render_match(self):
++        """左右两栏：英文 ↔ 中文，点击配对；计时器倒计时"""
++        self._build_type = "match"
++        pairs = self._data.get("pairs", {})
++        time_limit = self._data.get("time_limit", 15)
++
++        self._layout.addWidget(
++            self._make_label(f"⚡ 闪电配对（{time_limit} 秒）：", bold=True))
++
++        # 配对状态
++        self._matched = {}          # en_word -> zh_word（已配对）
++        self._selected_left = None  # 当前选中的英文
++        self._match_pairs = pairs
++        self._match_total = len(pairs)
++
++        # 打乱中文顺序（避免位置提示）
++        en_words = list(pairs.keys())
++        zh_words = list(pairs.values())
++        random.shuffle(zh_words)
++
++        columns = QHBoxLayout()
++        columns.setSpacing(24)
++
++        # 左栏：英文
++        left_col = QVBoxLayout()
++        left_col.addWidget(self._make_label("英文", color="#666666"))
++        self._left_buttons = {}
++        for en in en_words:
++            btn = self._make_chip(en)
++            # 必须用默认参数绑定 btn（否则闭包引用循环变量，全部指向最后一个按钮）
++            btn.clicked.connect(lambda checked, e=en, b=btn: self._on_left_click(e, b))
++            left_col.addWidget(btn)
++            self._left_buttons[en] = btn
++
++        # 右栏：中文
++        right_col = QVBoxLayout()
++        right_col.addWidget(self._make_label("中文", color="#666666"))
++        self._right_buttons = {}
++        for zh in zh_words:
++            btn = self._make_chip(zh)
++            # 同上：绑定 btn 为默认参数，避免闭包陷阱
++            btn.clicked.connect(lambda checked, z=zh, b=btn: self._on_right_click(z, b))
++            right_col.addWidget(btn)
++            self._right_buttons[zh] = btn
++
++        columns.addLayout(left_col)
++        columns.addLayout(right_col)
++        self._layout.addLayout(columns)
++
++        # 计时器
++        self._time_left = time_limit
++        self._timer_label = self._make_label(f"⏱ {time_limit}s", color="#D9534F")
++        self._layout.addWidget(self._timer_label)
++        self._match_timer = QTimer(self)
++        self._match_timer.timeout.connect(self._on_match_tick)
++        self._match_timer.start(1000)
++
++    def _on_left_click(self, en_word, btn):
++        """选中左栏英文"""
++        if self._answered:
++            return
++        self._selected_left = en_word
++        for b in self._left_buttons.values():
++            b.setStyleSheet(self._chip_style())
++        btn.setStyleSheet(self._chip_selected_style())
++
++    def _on_right_click(self, zh_word, btn):
++        """选中右栏中文 → 与当前英文配对"""
++        if self._answered or self._selected_left is None:
++            return
++        en_word = self._selected_left
++        self._matched[en_word] = zh_word
++        # 禁用已配对按钮
++        self._left_buttons[en_word].setEnabled(False)
++        self._left_buttons[en_word].setStyleSheet(self._chip_disabled_style())
++        btn.setEnabled(False)
++        btn.setStyleSheet(self._chip_disabled_style())
++        self._selected_left = None
++        # 全部配对完成 → 自动提交
++        if len(self._matched) >= self._match_total:
++            self._match_timer.stop()
++            self._submit_match(auto=True)
++
++    def _on_match_tick(self):
++        """计时器滴答：减一秒，到 0 自动提交"""
++        self._time_left -= 1
++        self._timer_label.setText(f"⏱ {self._time_left}s")
++        if self._time_left <= 0:
++            self._match_timer.stop()
++            self._submit_match(auto=True)
++
++    def _submit_match(self, auto=False):
++        """配对题提交（自动或手动）"""
++        if self._answered:
++            return
++        # 配对题答案格式：按英文顺序排列的中文，用 / 分隔
++        pairs = self._match_pairs
++        zh_list = [self._matched.get(en, "") for en in pairs.keys()]
++        user_answer = " / ".join(zh_list)
++        if self._window is not None:
++            self._window._check_answer(self, self._data, user_answer)
++
++    # ── 题型 4：翻译拼装（translate_assemble）──
++    def _render_translate_assemble(self):
++        """中文提示 + 英文词芯片（含干扰词），按顺序点击拼装翻译"""
++        self._build_type = "translate_assemble"
++        prompt = self._data.get("prompt", "请翻译：")
++        self._layout.addWidget(self._make_label(prompt, bold=True))
++
++        words = self._data.get("words", [])
++        correct_order = self._data.get("correct_order", list(range(len(words))))
++        self._correct_sentence = " ".join(words[i] for i in correct_order)
++        self._build_indices = []
++
++        self._layout.addWidget(
++            self._make_label("点击单词按顺序拼装英文翻译：", color="#666666"))
++
++        # 词池
++        pool_wrap = QWidget()
++        pool_wrap.setStyleSheet("background: transparent;")
++        self._pool_layout = QHBoxLayout(pool_wrap)
++        self._pool_layout.setSpacing(6)
++        self._pool_layout.setContentsMargins(0, 0, 0, 0)
++        self._pool_layout.addStretch(1)
++        self._layout.addWidget(pool_wrap)
++
++        # 构建区
++        build_wrap = QWidget()
++        build_wrap.setStyleSheet("background: transparent;")
++        self._build_layout = QHBoxLayout(build_wrap)
++        self._build_layout.setSpacing(6)
++        self._build_layout.setContentsMargins(0, 0, 0, 0)
++        self._build_layout.addStretch(1)
++        self._layout.addWidget(build_wrap)
++
++        self._pool_chips = {}
++        self._build_chips = {}
++        for i, word in enumerate(words):
++            btn = self._make_chip(word)
++            btn.clicked.connect(lambda checked, idx=i: self._on_pool_click(idx))
++            self._pool_layout.insertWidget(self._pool_layout.count() - 1, btn)
++            self._pool_chips[i] = btn
++
++    # ── 题型 5：故事分支（story）──
++    def _render_story(self):
++        """英文故事 + 多个选项，单选"""
++        self._build_type = "story"
++        story_text = self._data.get("story_text", "")
++        self._layout.addWidget(self._make_label(story_text, bold=False))
++
++        choices = self._data.get("choices", [])
++        self._selected_choice = None
++
++        self._story_group = QButtonGroup(self)
++        self._story_group.setExclusive(True)
++        self._story_buttons = []
++        for i, choice in enumerate(choices):
++            btn = QRadioButton(choice)
++            btn.setStyleSheet("font-size: 13px; padding: 4px 0; background: transparent;")
++            btn.clicked.connect(lambda checked, c=choice: self._on_story_click(c))
++            self._story_group.addButton(btn, i)
++            self._layout.addWidget(btn)
++            self._story_buttons.append(btn)
++
++    def _on_story_click(self, choice):
++        """选中一个故事选项"""
++        if self._answered:
++            return
++        self._selected_choice = choice
++
++    def _render_unknown(self):
++        """未知题型兜底"""
++        self._build_type = "unknown"
++        self._layout.addWidget(
++            self._make_label(f"未知题型：{self._data.get('type')}", color="#D9534F"))
++
++    # ── 操作按钮（检查答案 / 提示 / 跳过）──
++    def _add_action_buttons(self):
++        """底部操作按钮行"""
++        row = QHBoxLayout()
++        row.addStretch(1)
++
++        self._check_btn = QPushButton("检查答案")
++        self._check_btn.setCursor(Qt.PointingHandCursor)
++        self._check_btn.setStyleSheet(self._btn_primary_style())
++        self._check_btn.clicked.connect(self._on_check_answer)
++        row.addWidget(self._check_btn)
++
++        hint_btn = QPushButton("提示")
++        hint_btn.setCursor(Qt.PointingHandCursor)
++        hint_btn.setStyleSheet(self._btn_secondary_style())
++        hint_btn.clicked.connect(self._on_hint)
++        row.addWidget(hint_btn)
++
++        skip_btn = QPushButton("跳过")
++        skip_btn.setCursor(Qt.PointingHandCursor)
++        skip_btn.setStyleSheet(self._btn_secondary_style())
++        skip_btn.clicked.connect(self._on_skip)
++        row.addWidget(skip_btn)
++
++        self._layout.addLayout(row)
++
++    def _on_check_answer(self):
++        """检查答案按钮回调"""
++        if self._answered:
++            return
++        # 配对题手动提交时停止计时器（避免超时重复提交）
++        if self._data.get("type") == "match" and hasattr(self, "_match_timer"):
++            self._match_timer.stop()
++        user_answer = self._get_user_answer()
++        if self._window is not None:
++            self._window._check_answer(self, self._data, user_answer)
++
++    def _on_hint(self):
++        """提示按钮：显示第一个正确答案线索"""
++        if self._answered:
++            return
++        hint_text = self._get_hint()
++        if hint_text:
++            label = self._make_label(f"💡 {hint_text}", color="#2E9E57")
++            self._layout.insertWidget(self._layout.count() - 1, label)
++
++    def _on_skip(self):
++        """跳过按钮回调"""
++        if self._answered:
++            return
++        if self._window is not None:
++            self._window._skip_exercise(self, self._data)
++
++    # ── 获取用户答案 ──
++    def _get_user_answer(self):
++        """按题型返回用户答案字符串"""
++        t = self._data.get("type")
++        if t == "sentence_build":
++            return self._get_sentence()
++        if t == "cloze":
++            return self._selected_option or ""
++        if t == "match":
++            # 配对题：按英文顺序列出中文
++            pairs = self._data.get("pairs", {})
++            zh_list = [self._matched.get(en, "") for en in pairs.keys()]
++            return " / ".join(zh_list)
++        if t == "translate_assemble":
++            return self._get_sentence()
++        if t == "story":
++            return self._selected_choice or ""
++        return ""
++
++    def _get_hint(self):
++        """按题型返回提示文字"""
++        t = self._data.get("type")
++        if t == "sentence_build":
++            correct = self._data.get("correct_order", [])
++            words = self._data.get("words", [])
++            if correct and words:
++                return f"第一个词是：{words[correct[0]]}"
++        elif t == "cloze":
++            return f"正确答案是：{self._data.get('answer', '')}"
++        elif t == "match":
++            pairs = self._data.get("pairs", {})
++            if pairs:
++                first_en = next(iter(pairs))
++                return f"{first_en} → {pairs[first_en]}"
++        elif t == "translate_assemble":
++            correct = self._data.get("correct_order", [])
++            words = self._data.get("words", [])
++            if correct and words:
++                return f"第一个词是：{words[correct[0]]}"
++        elif t == "story":
++            return f"正确选项是：{self._data.get('answer', '')}"
++        return ""
++
++    # ── 样式工具 ──
++    @staticmethod
++    def _make_label(text, bold=False, color="#1F2430"):
++        label = QLabel(text)
++        label.setWordWrap(True)
++        weight = "bold" if bold else "normal"
++        label.setStyleSheet(
++            f"color: {color}; font-size: 13px; font-weight: {weight};"
++            f" background: transparent; padding: 2px 0;")
++        return label
++
++    @staticmethod
++    def _make_chip(text):
++        btn = QPushButton(text)
++        btn.setCursor(Qt.PointingHandCursor)
++        btn.setStyleSheet(ExerciseCard._chip_style())
++        return btn
++
++    @staticmethod
++    def _chip_style():
++        return """
++            QPushButton { background-color: rgba(70,130,180,200); color: white;
++                          border: none; border-radius: 10px;
++                          padding: 6px 14px; font-size: 13px; }
++            QPushButton:hover { background-color: rgba(50,110,160,230); }
++        """
++
++    @staticmethod
++    def _chip_selected_style():
++        return """
++            QPushButton { background-color: rgba(46,158,87,235); color: white;
++                          border: 2px solid #1F2430; border-radius: 10px;
++                          padding: 6px 14px; font-size: 13px; }
++        """
++
++    @staticmethod
++    def _chip_disabled_style():
++        return """
++            QPushButton { background-color: rgba(200,200,200,150); color: #999;
++                          border: none; border-radius: 10px;
++                          padding: 6px 14px; font-size: 13px; }
++        """
++
++    @staticmethod
++    def _btn_primary_style():
++        return """
++            QPushButton { background-color: rgba(46,158,87,235); color: white;
++                          border: none; border-radius: 10px;
++                          padding: 6px 18px; font-size: 13px; font-weight: bold; }
++            QPushButton:hover { background-color: rgba(38,138,76,245); }
++        """
++
++    @staticmethod
++    def _btn_secondary_style():
++        return """
++            QPushButton { background-color: rgba(120,120,120,180); color: white;
++                          border: none; border-radius: 10px;
++                          padding: 6px 18px; font-size: 13px; }
++            QPushButton:hover { background-color: rgba(100,100,100,220); }
++        """
++
++
++class EnglishRoomWindow(RoomWindow):
++    """英语教室：左聊右练"""
++
++    def __init__(self, friend_id: int, word_range: str = "CET-4",
++                 start_mode: str = "restart", parent=None):
++        self._word_range = word_range
++        self._start_mode = start_mode
++        self._current_card = None
++        self._current_tool_call_id = ""
++        super().__init__(friend_id, "english", parent=parent)
++
++    def _build_ui(self):
++        super()._build_ui()
++        # 左侧聊天区固定 280px（和阅读室右边聊天区同宽）
++        self.chat_scroll.setFixedWidth(280)
++        # 右侧练习面板
++        self.exercise_panel = QFrame()
++        self.exercise_panel.setStyleSheet("background: transparent;")
++        self._exercise_layout = QVBoxLayout(self.exercise_panel)
++        self._exercise_layout.setContentsMargins(16, 16, 16, 16)
++        self._exercise_layout.addStretch(1)
++        # 插入到内容区右侧
++        self._content_host.addWidget(self.exercise_panel, 1)
++        # 统计标签（放在顶栏标题后）
++        self._stats_label = QLabel("")
++        self._stats_label.setStyleSheet(
++            "color: rgba(245,239,230,210); font-size: 12px; background: transparent;")
++        self._update_stats()
++        # 把统计标签插到顶栏标题右侧（self._top_layout 由父类 _build_ui 设置）
++        self._top_layout.addWidget(self._stats_label, 1)
++
++    def _on_send(self):
++        """发消息前把当前词表范围注入 worker，并连接练习请求信号"""
++        super()._on_send()
++        if self.ai_worker is not None:
++            self.ai_worker._word_range = self._word_range
++            try:
++                self.ai_worker.exercise_requested.connect(
++                    self._on_exercise_requested)
++            except RuntimeError:
++                pass  # 已连接
++
++    def _update_stats(self):
++        """刷新顶部统计"""
++        stats = get_stats(self.friend_id)
++        self._stats_label.setText(
++            f"🔥 连胜 {stats['streak']}  |  "
++            f"今日 {stats['today_count']} 题  |  "
++            f"正确率 {stats['accuracy']}%")
++
++    def _on_exercise_requested(self, code: str, word_range: str, reason: str):
++        """AIWorker 发出 exercise_requested 信号时渲染卡片"""
++        self.input_edit.setEnabled(False)
++        self.send_btn.setEnabled(False)
++        try:
++            data = json.loads(code)
++        except (json.JSONDecodeError, TypeError):
++            logger.error("解析练习数据失败: %s", code[:100])
++            return
++        self._render_exercise_card(data)
++
++    def _render_exercise_card(self, data: dict):
++        """根据题型渲染对应卡片"""
++        # 清除旧卡片
++        if self._current_card is not None:
++            self._exercise_layout.removeWidget(self._current_card)
++            self._current_card.deleteLater()
++            self._current_card = None
++        # 创建新卡片（构造函数内完成渲染）
++        card = ExerciseCard(data, window=self, parent=self.exercise_panel)
++        # 插到 stretch 之前（靠上显示）
++        self._exercise_layout.insertWidget(
++            self._exercise_layout.count() - 1, card)
++        self._current_card = card
++
++    # ── 答题回传 ──
++    def _check_answer(self, card, data, user_answer):
++        """检查答案：落库 + 显示反馈 + 回传 AI + 启用输入"""
++        if card._answered:
++            return
++        card._answered = True
++        card._attempts += 1
++        correct_answer = data.get("answer", "")
++        correct = user_answer.strip().lower() == correct_answer.strip().lower()
++        time_used = time.time() - card._start_time
++        is_bonus = data.get("is_bonus", False)
++
++        # 落库
++        record_exercise(self.friend_id, data.get("word", ""),
++                        data.get("type", ""), correct,
++                        card._attempts, time_used, is_bonus)
++        upsert_progress(self.friend_id, self._word_range,
++                        data.get("word", ""), correct)
++
++        # 显示反馈
++        self._show_feedback(card, correct, correct_answer,
++                            data.get("explanation", ""))
++
++        # 回传 AI
++        result = {
++            "correct": correct,
++            "user_answer": user_answer,
++            "correct_answer": correct_answer,
++            "attempts": card._attempts,
++            "time_used": time_used,
++            "exercise_type": data.get("type", ""),
++            "skipped": False,
++        }
++        if self.ai_worker is not None:
++            self.ai_worker.resume_exercise(json.dumps(result))
++
++        self._update_stats()
++        # 启用输入条
++        self.input_edit.setEnabled(True)
++        self.send_btn.setEnabled(True)
++
++    def _skip_exercise(self, card, data):
++        """跳过练习：回传 AI + 启用输入"""
++        if card._answered:
++            return
++        card._answered = True
++        result = {
++            "correct": False,
++            "user_answer": "",
++            "correct_answer": data.get("answer", ""),
++            "attempts": 0,
++            "time_used": 0,
++            "exercise_type": data.get("type", ""),
++            "skipped": True,
++        }
++        if self.ai_worker is not None:
++            self.ai_worker.resume_exercise(json.dumps(result))
++        self.input_edit.setEnabled(True)
++        self.send_btn.setEnabled(True)
++
++    def _show_feedback(self, card, correct, correct_answer, explanation):
++        """在卡片中显示答题反馈"""
++        feedback = QLabel()
++        if correct:
++            feedback.setText(f"✅ 正确！\n{explanation}")
++            feedback.setStyleSheet(
++                "color: #2E9E57; font-size: 13px; padding: 8px;"
++                " background: transparent;")
++        else:
++            feedback.setText(f"❌ 错误。正确答案：{correct_answer}\n{explanation}")
++            feedback.setStyleSheet(
++                "color: #D9534F; font-size: 13px; padding: 8px;"
++                " background: transparent;")
++        card._layout.addWidget(feedback)
++
++    def _current_scene_prompt(self) -> str:
++        """覆盖父类：注入当前词库范围 + 实时进度统计的场景 prompt"""
++        from shadowtalk.core.english_exercise import build_scene_prompt
++        return build_scene_prompt(self.friend_id, self._word_range)
++
++    def closeEvent(self, event):
++        if self._current_card is not None:
++            self._current_card.deleteLater()
++            self._current_card = None
++        super().closeEvent(event)
+diff --git a/aiworkspace18/shadowtalk/ui/widgets/english_word_range_dialog.py b/aiworkspace18/shadowtalk/ui/widgets/english_word_range_dialog.py
+new file mode 100644
+index 0000000..a8a00fe
+--- /dev/null
++++ b/aiworkspace18/shadowtalk/ui/widgets/english_word_range_dialog.py
+@@ -0,0 +1,100 @@
++"""英语教室词库选择对话框"""
++import logging
++
++from PySide6.QtCore import Qt
++from PySide6.QtWidgets import (
++    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QRadioButton,
++    QButtonGroup, QPushButton,
++)
++
++logger = logging.getLogger(__name__)
++
++WORD_RANGES = [
++    ("CET-4", "大学英语四级 · ~4500 词"),
++    ("CET-6", "大学英语六级 · ~5500 词"),
++    ("IELTS", "雅思核心 · ~6000 词"),
++    ("TOEFL", "托福核心 · ~8000 词"),
++]
++
++
++class EnglishWordRangeDialog(QDialog):
++    """词库范围 + 起始模式选择"""
++
++    def __init__(self, parent=None, has_progress=False):
++        super().__init__(parent)
++        self.setWindowTitle("🏫 英语教室")
++        self.setModal(True)
++        self.resize(380, 280)
++        self._has_progress = has_progress
++        self._build_ui()
++
++    def _build_ui(self):
++        layout = QVBoxLayout(self)
++        layout.setContentsMargins(20, 18, 20, 18)
++        layout.setSpacing(10)
++
++        title = QLabel("📚 选择词库范围")
++        title.setStyleSheet("font-size: 15px; font-weight: bold; color: #1F2430;")
++        layout.addWidget(title)
++
++        self._range_group = QButtonGroup(self)
++        for key, desc in WORD_RANGES:
++            row = QHBoxLayout()
++            rb = QRadioButton(key)
++            rb.setStyleSheet("font-size: 13px; color: #1F2430;")
++            desc_lbl = QLabel(f"  {desc}")
++            desc_lbl.setStyleSheet("font-size: 11px; color: #7A7A7A;")
++            row.addWidget(rb)
++            row.addWidget(desc_lbl, 1)
++            layout.addLayout(row)
++            self._range_group.addButton(rb)
++            if key == "CET-4":
++                rb.setChecked(True)
++
++        layout.addSpacing(8)
++        mode_label = QLabel("起始方式")
++        mode_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #1F2430;")
++        layout.addWidget(mode_label)
++
++        self._mode_group = QButtonGroup(self)
++        self._continue_rb = QRadioButton("从上次进度继续")
++        self._restart_rb = QRadioButton("从头开始")
++        self._test_rb = QRadioButton("快速测试后定级")
++        for rb in (self._continue_rb, self._restart_rb, self._test_rb):
++            rb.setStyleSheet("font-size: 12px; color: #1F2430;")
++            layout.addWidget(rb)
++            self._mode_group.addButton(rb)
++        if self._has_progress:
++            self._continue_rb.setChecked(True)
++        else:
++            self._restart_rb.setChecked(True)
++            self._continue_rb.setEnabled(False)
++
++        layout.addStretch()
++
++        btn_row = QHBoxLayout()
++        btn_row.addStretch()
++        ok_btn = QPushButton("进入教室")
++        ok_btn.setStyleSheet("""
++            QPushButton { background: #2E9E57; color: white; border: none;
++                         border-radius: 8px; padding: 8px 24px; font-weight: bold; }
++            QPushButton:hover { background: #248a4a; }
++        """)
++        ok_btn.clicked.connect(self.accept)
++        btn_row.addWidget(ok_btn)
++        layout.addLayout(btn_row)
++
++    def get_selected_range(self) -> tuple:
++        """返回 (word_range, start_mode)"""
++        range_btn = self._range_group.checkedButton()
++        range_key = "CET-4"
++        for key, _ in WORD_RANGES:
++            if range_btn and range_btn.text() == key:
++                range_key = key
++                break
++        mode = "continue"
++        if self._restart_rb.isChecked():
++            mode = "restart"
++        elif self._test_rb.isChecked():
++            mode = "test"
++        return (range_key, mode)
+diff --git a/aiworkspace18/shadowtalk/ui/widgets/room_window.py b/aiworkspace18/shadowtalk/ui/widgets/room_window.py
+index 9621426..3330b58 100644
+--- a/aiworkspace18/shadowtalk/ui/widgets/room_window.py
++++ b/aiworkspace18/shadowtalk/ui/widgets/room_window.py
+@@ -22,21 +22,21 @@ from shadowtalk.core.room_service import (
+     build_room_context, get_room, get_room_bg, save_room_bg,
+ )
+ from shadowtalk.core.tts_service import resolve_voice
+ from shadowtalk.data.repositories import FriendRepository, MessageRepository
+ from shadowtalk.data.database import Database
+ from shadowtalk.ui.threads.ai_worker import AIWorker
+ from shadowtalk.ui.widgets.tts_player import get_player
+ 
+ logger = logging.getLogger(__name__)
+ 
+-_ROOM_ICONS = {"cafe": "☕", "music": "🎵", "reading": "📖"}
++_ROOM_ICONS = {"cafe": "☕", "music": "🎵", "reading": "📖", "english": "🏫"}
+ 
+ 
+ def _now_hhmm() -> str:
+     return datetime.now().strftime("%H:%M")
+ 
+ 
+ class RoomBubble(QWidget):
+     """悬浮对话气泡：半透明圆角；AI 侧带点播按钮"""
+     play_requested = Signal(str, int)   # (text, msg_id)
+ 
+@@ -134,20 +134,21 @@ class RoomWindow(QDialog):
+     # ── UI ──
+     def _build_ui(self):
+         layout = QVBoxLayout(self)
+         layout.setContentsMargins(0, 0, 0, 0)
+         layout.setSpacing(0)
+ 
+         # 顶部半透明工具条
+         top = QFrame()
+         top.setStyleSheet("background-color: rgba(20,16,12,120);")
+         top_l = QHBoxLayout(top)
++        self._top_layout = top_l   # 子类（英语教室）往顶栏插统计标签
+         top_l.setContentsMargins(18, 8, 14, 8)
+         icon = _ROOM_ICONS.get(self.room.get("key", ""), "🏠")
+         title = QLabel(f"{icon} {self.room['name']} · 与 {self.friend_name}")
+         title.setStyleSheet("color: #F5EFE6; font-size: 14px; background: transparent;")
+         top_l.addWidget(title)
+         top_l.addStretch()
+         bg_btn = QPushButton("换背景")
+         leave_btn = QPushButton("离开房间")
+         # QDialog 按钮默认 autoDefault=True：Enter（含输入法提交的回车）
+         # 会激活"默认按钮"——创建顺序第一个是换背景 → 误弹文件选择框。
+diff --git a/aiworkspace18/tests/test_ai_client.py b/aiworkspace18/tests/test_ai_client.py
+index 9afabe9..a6ae7e7 100644
+--- a/aiworkspace18/tests/test_ai_client.py
++++ b/aiworkspace18/tests/test_ai_client.py
+@@ -169,20 +169,28 @@ def test_chat_with_tools_empty_everything_returns_fallback():
+ 
+         client = AIClient(base_url="https://t", api_key="k", model="m")
+         result = client.chat_with_tools(
+             [{"role": "user", "content": "在吗"}],
+             tool_runner=lambda c, r: "out"
+         )
+     assert isinstance(result, str)
+     assert result.strip(), "兜底文案不得为空"
+ 
+ 
++def test_present_exercise_in_tools():
++    """present_exercise 工具应出现在 chat_with_tools 的工具列表中"""
++    import shadowtalk.core.ai_client as ai_mod
++    src = open(ai_mod.__file__, encoding="utf-8").read()
++    assert "present_exercise" in src
++    assert "PRESENT_EXERCISE_TOOL" in src
++
++
+ def test_chat_with_tools_filters_empty_assistant_history():
+     """已落库的空 assistant 消息不得发给 API（毒害后续请求致持续空回复）"""
+     final_msg = MagicMock()
+     final_msg.content = "好的"
+     final_msg.tool_calls = None
+     resp = MagicMock()
+     resp.choices = [MagicMock(message=final_msg)]
+ 
+     with patch("openai.OpenAI") as MockOpenAI:
+         mock_instance = MockOpenAI.return_value
+diff --git a/aiworkspace18/tests/test_ai_worker.py b/aiworkspace18/tests/test_ai_worker.py
+index 43c6c16..6ade782 100644
+--- a/aiworkspace18/tests/test_ai_worker.py
++++ b/aiworkspace18/tests/test_ai_worker.py
+@@ -1,11 +1,13 @@
+ """AIWorker 工作目录守卫测试"""
++import json
++
+ from shadowtalk.ui.threads.ai_worker import AIWorker
+ 
+ 
+ def test_ai_worker_denies_tool_when_work_dir_empty():
+     worker = AIWorker(friend_id=1, user_message="", ai_client=None,
+                       messages=[], work_dir="")
+     reply = worker._run_tool("print('hi')", "随便")
+     # 拒绝文案的两个关键片段（源码为跨行拼接的单一字符串）
+     assert "当前好友未配置工作目录" in reply
+     assert "即可让我读写文件" in reply
+@@ -94,10 +96,100 @@ def test_run_tool_emits_activity_steps(monkeypatch):
+         lambda code, wd: [])
+ 
+     events = []
+     worker = AIWorker(friend_id=1, user_message="x", ai_client=None,
+                       messages=[], work_dir="D:/w")
+     worker.activity.connect(events.append)
+     worker._run_tool("print(1)", "生成天气报告")
+ 
+     assert any("生成天气报告" in e for e in events)
+     assert any("完成" in e for e in events)
++
++
++# ── 练习挂起/恢复机制（Task 4：英语练习出题时挂起 AIWorker，等用户答题）──
++
++def test_exercise_signals_exist():
++    """AIWorker 应有 exercise_requested 和 exercise_answered 信号"""
++    assert hasattr(AIWorker, "exercise_requested")
++    assert hasattr(AIWorker, "exercise_answered")
++
++
++def test_resume_exercise_method_exists():
++    """AIWorker 应有 resume_exercise 方法"""
++    assert hasattr(AIWorker, "resume_exercise")
++
++
++def test_exercise_suspends_and_returns_result():
++    """present_exercise 工具：_run_tool 挂起并返回用户答题结果 JSON"""
++    import threading
++    import time as _time
++
++    from PySide6.QtCore import Qt
++    from PySide6.QtWidgets import QApplication
++    # QEventLoop 需要 QApplication 存在
++    app = QApplication.instance() or QApplication([])
++
++    worker = AIWorker(friend_id=1, user_message="x", ai_client=None,
++                      messages=[], work_dir="D:/w", word_range="NCE2-L1")
++
++    # 收集 exercise_requested 信号参数（DirectConnection 确保跨线程同步触发）
++    captured = []
++    worker.exercise_requested.connect(
++        lambda *a: captured.append(a), Qt.DirectConnection)
++
++    # 在另一个线程调用 _run_tool（模拟 AI 调用 present_exercise）
++    result_holder = {}
++
++    def run_tool():
++        exercise_json = json.dumps({
++            "word": "apple", "correct": "苹果",
++            "options": ["苹果", "香蕉", "橙子", "葡萄"]
++        })
++        result_holder["result"] = worker._run_tool(exercise_json, "出题: apple")
++
++    t = threading.Thread(target=run_tool)
++    t.start()
++
++    # 等待信号发出（挂起）
++    _time.sleep(0.3)
++    assert len(captured) == 1, "exercise_requested 应已发出"
++    # 信号参数：(exercise_json, word_range, reason)
++    assert captured[0][1] == "NCE2-L1"
++    assert "出题" in captured[0][2]
++
++    # 模拟用户答题后 UI 调用 resume_exercise
++    answer_json = json.dumps({
++        "correct": True, "user_answer": "苹果", "correct_answer": "苹果",
++        "attempts": 1, "time_used": 3.2, "exercise_type": "choice"
++    })
++    worker.resume_exercise(answer_json)
++    t.join(timeout=2)
++
++    # 验证返回的是用户答题结果
++    assert json.loads(result_holder["result"])["correct"] is True
++    assert json.loads(result_holder["result"])["user_answer"] == "苹果"
++
++
++def test_exercise_resume_before_signal_is_safe():
++    """resume_exercise 在循环未启动时调用不崩溃（幂等安全）"""
++    worker = AIWorker(friend_id=1, user_message="x", ai_client=None,
++                      messages=[], work_dir="D:/w")
++    # 未启动循环时调用不应抛异常
++    worker.resume_exercise(json.dumps({"correct": False}))
++
++
++def test_regular_tool_not_misdetected_as_exercise():
++    """普通工具调用（reason 非 "出题: "）不被误判为练习"""
++    events = []
++    worker = AIWorker(friend_id=1, user_message="x", ai_client=None,
++                      messages=[], work_dir="D:/w")
++    worker.activity.connect(events.append)
++
++    # 用 monkeypatch 替换 _execute_tool 避免真正执行
++    original = worker._execute_tool
++    called = []
++    worker._execute_tool = lambda code, reason: called.append((code, reason)) or "executed"
++
++    result = worker._run_tool("print('hi')", "写文件")
++    assert result == "executed"
++    assert called == [("print('hi')", "写文件")]
++    worker._execute_tool = original
+diff --git a/aiworkspace18/tests/test_database.py b/aiworkspace18/tests/test_database.py
+index 4cd9c8d..e79f072 100644
+--- a/aiworkspace18/tests/test_database.py
++++ b/aiworkspace18/tests/test_database.py
+@@ -108,20 +108,40 @@ def test_migrate_adds_work_dir_to_old_friends_table():
+     cols = {row[1] for row in conn.execute("PRAGMA table_info(friends)")}
+     assert "work_dir" in cols
+ 
+     conn.execute("INSERT INTO friends (name) VALUES (?)", ("旧库好友",))
+     row = conn.execute(
+         "SELECT work_dir FROM friends WHERE name=?", ("旧库好友",)
+     ).fetchone()
+     assert row is not None
+     assert row["work_dir"] == ""
+ 
++def test_english_tables_exist():
++    """英语教室答题记录表和进度表应在 _migrate 后存在"""
++    from shadowtalk.data.database import Database
++    conn = Database.get_connection()
++    tables = {row[0] for row in conn.execute(
++        "SELECT name FROM sqlite_master WHERE type='table'")}
++    assert "english_exercise_stats" in tables
++    assert "english_progress" in tables
++
++
++def test_english_room_seeded():
++    """英语教室房间应在 _migrate 后存在"""
++    from shadowtalk.data.database import Database
++    conn = Database.get_connection()
++    row = conn.execute(
++        "SELECT name FROM rooms WHERE key='english'").fetchone()
++    assert row is not None
++    assert row["name"] == "英语教室"
++
++
+ def test_db_path_under_base_dir(monkeypatch):
+     """DB 文件应位于基目录下（打包后 = exe 目录）"""
+     import sys
+     import importlib
+     import shadowtalk.data.database as orig_module
+     import shadowtalk.data as data_pkg
+ 
+     # conftest 的 autouse fixture 会把 DB_PATH 替换为临时库路径；
+     # 本测试验证的是模块导入时的默认落位（不受 fixture 补丁影响），
+     # 因此临时移除 sys.modules 缓存重新导入，随后恢复原模块。
+diff --git a/aiworkspace18/tests/test_english_exercise.py b/aiworkspace18/tests/test_english_exercise.py
+new file mode 100644
+index 0000000..d5b25e0
+--- /dev/null
++++ b/aiworkspace18/tests/test_english_exercise.py
+@@ -0,0 +1,124 @@
++import datetime
++import pytest
++from shadowtalk.core.english_exercise import (
++    record_exercise, upsert_progress, get_next_word, get_stats,
++    PRESENT_EXERCISE_TOOL, build_scene_prompt,
++)
++
++
++def _seed_friend(friend_id=1):
++    """写入一条好友记录以满足外键约束（测试数据库默认无数据）。"""
++    from shadowtalk.data.database import Database
++    Database.get_connection().execute(
++        "INSERT OR IGNORE INTO friends (id, name) VALUES (?, ?)",
++        (friend_id, "test_friend")
++    )
++
++
++def test_record_exercise_inserts_row(test_database):
++    _seed_friend()
++    record_exercise(1, "perseverance", "sentence_build", True, 1, 5.2, False)
++    from shadowtalk.data.database import Database
++    conn = Database.get_connection()
++    row = conn.execute(
++        "SELECT * FROM english_exercise_stats WHERE friend_id=1 AND word=?",
++        ("perseverance",)).fetchone()
++    assert row is not None
++    assert row["correct"] == 1
++
++
++def test_upsert_progress_creates_new(test_database):
++    _seed_friend()
++    result = upsert_progress(1, "CET-4", "abandon", True)
++    assert result["status"] == "learning"
++    assert result["times_correct"] == 1
++
++
++def test_upsert_progress_updates_existing(test_database):
++    _seed_friend()
++    upsert_progress(1, "CET-4", "abandon", True)
++    result = upsert_progress(1, "CET-4", "abandon", False)
++    assert result["times_correct"] == 1
++    assert result["times_wrong"] == 1
++
++
++def test_get_next_word_priority(test_database):
++    _seed_friend()
++    past = (datetime.datetime.now() - datetime.timedelta(hours=1)).isoformat()
++    from shadowtalk.data.database import Database
++    conn = Database.get_connection()
++    conn.execute(
++        "INSERT INTO english_progress (friend_id, word_range, word, status, review_at) "
++        "VALUES (1, 'CET-4', 'abandon', 'review', ?)", (past,))
++    conn.execute(
++        "INSERT INTO english_progress (friend_id, word_range, word, status) "
++        "VALUES (1, 'CET-4', 'benefit', 'new')")
++    word = get_next_word(1, "CET-4")
++    assert word == "abandon"
++
++
++def test_get_stats_streak(test_database):
++    _seed_friend()
++    for _ in range(5):
++        record_exercise(1, "w", "cloze", True, 1, 1.0, False)
++    stats = get_stats(1)
++    assert stats["streak"] == 5
++
++
++def test_present_exercise_tool_schema(test_database):
++    tool = PRESENT_EXERCISE_TOOL
++    assert tool["type"] == "function"
++    assert tool["function"]["name"] == "present_exercise"
++    assert "type" in tool["function"]["parameters"]["properties"]
++
++
++# ── build_scene_prompt 测试 ──
++
++def _seed_progress(friend_id, word_range):
++    """写入进度数据：2 mastered、1 learning、1 review_due"""
++    from shadowtalk.data.database import Database
++    conn = Database.get_connection()
++    now = datetime.datetime.now()
++    past = (now - datetime.timedelta(hours=1)).isoformat()
++    rows = [
++        # mastered：连续答对 3 次且从未答错
++        (friend_id, word_range, "word_a", "mastered", None, 3, 0, now.isoformat()),
++        (friend_id, word_range, "word_b", "mastered", None, 4, 0, now.isoformat()),
++        # learning
++        (friend_id, word_range, "word_c", "learning", None, 1, 0, now.isoformat()),
++        # review_due：review_at 已到期
++        (friend_id, word_range, "word_d", "learning", past, 0, 1, now.isoformat()),
++    ]
++    conn.executemany(
++        "INSERT INTO english_progress "
++        "(friend_id, word_range, word, status, review_at, times_correct, "
++        "times_wrong, last_exercise_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
++        rows,
++    )
++
++
++def test_build_scene_prompt_injects_word_range(test_database):
++    """build_scene_prompt 应将词库范围注入场景描述"""
++    _seed_friend()
++    prompt = build_scene_prompt(1, "CET-6")
++    assert "CET-6" in prompt
++    assert "英语" in prompt
++
++
++def test_build_scene_prompt_injects_stats(test_database):
++    """build_scene_prompt 应注入当前进度统计"""
++    _seed_friend()
++    _seed_progress(1, "IELTS")
++    prompt = build_scene_prompt(1, "IELTS")
++    assert "掌握" in prompt
++    # 验证具体数字：2 mastered、1 learning、1 review_due
++    assert "2" in prompt  # mastered 数
++    assert "1" in prompt  # learning 或 review_due 数
++
++
++def test_build_scene_prompt_zero_stats(test_database):
++    """无进度数据时应返回 0 统计，不报错"""
++    _seed_friend()
++    prompt = build_scene_prompt(1, "CET-4")
++    assert "CET-4" in prompt
++    assert "0" in prompt  # 全 0 统计
+diff --git a/aiworkspace18/tests/test_english_room.py b/aiworkspace18/tests/test_english_room.py
+new file mode 100644
+index 0000000..4018ee0
+--- /dev/null
++++ b/aiworkspace18/tests/test_english_room.py
+@@ -0,0 +1,715 @@
++"""沉浸式英语教室 UI 测试：5 种题型渲染 + 答题回传。"""
++import json
++import sys
++
++import pytest
++from PySide6.QtWidgets import QApplication, QLabel
++
++from shadowtalk.data.database import Database
++from shadowtalk.data.repositories import FriendRepository
++
++Database.get_connection()   # 触发 rooms/迁移播种
++
++app = QApplication.instance() or QApplication(sys.argv)
++
++
++def _make_friend(name="小学"):
++    return FriendRepository.insert(name, "", "你是小学")
++
++
++class _FakeSignal:
++    """伪 Qt 信号：支持 connect / disconnect，调用时静默"""
++    def __init__(self):
++        self._slots = []
++
++    def connect(self, slot):
++        self._slots.append(slot)
++
++    def disconnect(self, slot=None):
++        if slot is None:
++            self._slots.clear()
++        else:
++            self._slots = [s for s in self._slots if s != slot]
++
++    def emit(self, *a, **k):
++        for s in self._slots:
++            try:
++                s(*a, **k)
++            except Exception:
++                pass
++
++
++class _FakeWorker:
++    """伪 AIWorker：提供 window 所需的信号接口，记录 resume_exercise 调用"""
++    finished = _FakeSignal()
++    failed = _FakeSignal()
++    approval_requested = _FakeSignal()
++    activity = _FakeSignal()
++
++    def __init__(self, *a, **k):
++        self.messages = k.get("messages", a[3] if len(a) > 3 else [])
++        self.resumed = []   # 记录每次 resume_exercise 的 result_json
++
++    def cancel(self):
++        pass
++
++    def isRunning(self):
++        return False
++
++    def wait(self, ms):
++        return True
++
++    def start(self):
++        pass
++
++    def resume_exercise(self, result_json):
++        self.resumed.append(result_json)
++
++
++@pytest.fixture()
++def room(monkeypatch):
++    from shadowtalk.ui.widgets import room_window as rw
++    from shadowtalk.ui.widgets.english_room import EnglishRoomWindow
++    fid = _make_friend()
++    monkeypatch.setattr(rw, "AIWorker", lambda *a, **k: _FakeWorker(*a, **k))
++    monkeypatch.setattr(rw, "AIClient", lambda *a, **k: object())
++    win = EnglishRoomWindow(fid)
++    yield win
++    win.close()
++
++
++# ── 骨架测试（保留）──
++def test_english_room_window_class():
++    """EnglishRoomWindow 应继承 RoomWindow"""
++    from shadowtalk.ui.widgets.english_room import EnglishRoomWindow
++    from shadowtalk.ui.widgets.room_window import RoomWindow
++    assert issubclass(EnglishRoomWindow, RoomWindow)
++
++
++def test_english_room_subclass_instance(room):
++    """实例化后是 RoomWindow 的子类实例"""
++    from shadowtalk.ui.widgets.room_window import RoomWindow
++    assert isinstance(room, RoomWindow)
++
++
++def test_chat_scroll_fixed_width(room):
++    """左侧聊天区固定 280px"""
++    assert room.chat_scroll.width() == 280
++
++
++def test_exercise_panel_exists(room):
++    """右侧练习面板已创建"""
++    assert room.exercise_panel is not None
++    found = False
++    for i in range(room._content_host.count()):
++        if room._content_host.itemAt(i).widget() is room.exercise_panel:
++            found = True
++            break
++    assert found, "exercise_panel 应在 _content_host 中"
++
++
++def test_stats_label_exists(room):
++    """顶部统计标签已创建"""
++    assert room._stats_label is not None
++    text = room._stats_label.text()
++    assert "连胜" in text
++    assert "今日" in text
++    assert "正确率" in text
++
++
++def test_exercise_requested_disables_input(room):
++    """AI 出题时应禁用输入栏"""
++    room.input_edit.setEnabled(True)
++    room.send_btn.setEnabled(True)
++    room._on_exercise_requested(
++        '{"type":"cloze","word":"test","answer":"test","explanation":"test"}',
++        "CET-4", "出题: 测试")
++    assert room.input_edit.isEnabled() is False
++    assert room.send_btn.isEnabled() is False
++
++
++def test_exercise_requested_invalid_json_no_crash(room):
++    """无效 JSON 不应崩溃，仅记日志"""
++    room._on_exercise_requested("not-json", "CET-4", "出题: 测试")
++
++
++def test_close_event_cleans_up_card(room):
++    """关闭窗口应清理当前卡片"""
++    room._on_exercise_requested(
++        '{"type":"cloze","word":"test","answer":"test","explanation":"test"}',
++        "CET-4", "出题: 测试")
++    assert room._current_card is not None
++    room.close()
++    assert room._current_card is None
++
++
++# ── 5 种题型渲染测试 ──
++def _render(room, data_dict):
++    """辅助：触发渲染并返回当前卡片"""
++    room._on_exercise_requested(json.dumps(data_dict), "CET-4", "出题: 测试")
++    return room._current_card
++
++
++def test_sentence_build_renders(room):
++    """sentence_build 题型应渲染为 ExerciseCard"""
++    from shadowtalk.ui.widgets.english_room import ExerciseCard
++    data = {
++        "type": "sentence_build",
++        "word": "perseverance",
++        "prompt": "排列成句",
++        "words": ["She", "never", "gives", "up"],
++        "correct_order": [0, 1, 2, 3],
++        "answer": "She never gives up",
++        "explanation": "主语 + 副词 + 动词短语",
++    }
++    card = _render(room, data)
++    assert isinstance(card, ExerciseCard)
++    assert card._data["type"] == "sentence_build"
++    # 词池应有 4 个芯片
++    assert len(card._pool_chips) == 4
++
++
++def test_cloze_renders(room):
++    """cloze 题型应渲染为 ExerciseCard"""
++    from shadowtalk.ui.widgets.english_room import ExerciseCard
++    data = {
++        "type": "cloze",
++        "word": "perseverance",
++        "prompt": "She showed great ____ in the face of adversity.",
++        "options": ["perseverance", "ignorance", "fragility", "arrogance"],
++        "answer": "perseverance",
++        "explanation": "perseverance 意为毅力",
++    }
++    card = _render(room, data)
++    assert isinstance(card, ExerciseCard)
++    assert len(card._cloze_buttons) == 4
++
++
++def test_match_renders(room):
++    """match 题型应渲染为 ExerciseCard"""
++    from shadowtalk.ui.widgets.english_room import ExerciseCard
++    data = {
++        "type": "match",
++        "word": "greetings",
++        "pairs": {"Hello": "你好", "Goodbye": "再见", "Thank you": "谢谢"},
++        "answer": "Hello-你好/Goodbye-再见/Thank you-谢谢",
++        "explanation": "常见问候语",
++        "time_limit": 15,
++    }
++    card = _render(room, data)
++    assert isinstance(card, ExerciseCard)
++    assert len(card._left_buttons) == 3
++    assert len(card._right_buttons) == 3
++
++
++def test_translate_assemble_renders(room):
++    """translate_assemble 题型应渲染为 ExerciseCard"""
++    from shadowtalk.ui.widgets.english_room import ExerciseCard
++    data = {
++        "type": "translate_assemble",
++        "word": "study",
++        "prompt": "我正在学习英语",
++        "words": ["I", "am", "studying", "English", "now"],
++        "correct_order": [0, 1, 2, 3],
++        "answer": "I am studying English",
++        "explanation": "现在进行时",
++    }
++    card = _render(room, data)
++    assert isinstance(card, ExerciseCard)
++    # 词池含干扰词共 5 个
++    assert len(card._pool_chips) == 5
++
++
++def test_story_renders(room):
++    """story 题型应渲染为 ExerciseCard"""
++    from shadowtalk.ui.widgets.english_room import ExerciseCard
++    data = {
++        "type": "story",
++        "word": "decision",
++        "story_text": "Tom found a wallet on the street. He looked inside and saw a lot of cash.",
++        "choices": ["He kept the money",
++                    "He took it to the police",
++                    "He threw it away",
++                    "He ignored it"],
++        "answer": "He took it to the police",
++        "explanation": "拾金不昧是正确行为",
++    }
++    card = _render(room, data)
++    assert isinstance(card, ExerciseCard)
++    assert len(card._story_buttons) == 4
++
++
++# ── 答题正确 / 错误测试 ──
++def test_cloze_correct_answer_records_stats(room, monkeypatch):
++    """选词填空答对：record_exercise 应被调用且 correct=True"""
++    recorded = []
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.record_exercise",
++        lambda *a, **k: recorded.append(a))
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.upsert_progress",
++        lambda *a, **k: None)
++
++    data = {
++        "type": "cloze",
++        "word": "perseverance",
++        "prompt": "She showed great ____.",
++        "options": ["perseverance", "ignorance", "fragility", "arrogance"],
++        "answer": "perseverance",
++        "explanation": "毅力",
++    }
++    card = _render(room, data)
++    # 模拟点击正确选项
++    card._on_cloze_click("perseverance", card._cloze_buttons[0])
++    card._on_check_answer()
++
++    assert len(recorded) == 1
++    # record_exercise(friend_id, word, type, correct, attempts, time_used, is_bonus)
++    assert recorded[0][1] == "perseverance"
++    assert recorded[0][2] == "cloze"
++    assert recorded[0][3] is True   # correct
++
++
++def test_cloze_wrong_answer_records_stats(room, monkeypatch):
++    """选词填空答错：record_exercise 应被调用且 correct=False"""
++    recorded = []
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.record_exercise",
++        lambda *a, **k: recorded.append(a))
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.upsert_progress",
++        lambda *a, **k: None)
++
++    data = {
++        "type": "cloze",
++        "word": "perseverance",
++        "prompt": "She showed great ____.",
++        "options": ["perseverance", "ignorance", "fragility", "arrogance"],
++        "answer": "perseverance",
++        "explanation": "毅力",
++    }
++    card = _render(room, data)
++    # 模拟点击错误选项
++    card._on_cloze_click("ignorance", card._cloze_buttons[1])
++    card._on_check_answer()
++
++    assert len(recorded) == 1
++    assert recorded[0][3] is False   # incorrect
++
++
++def test_sentence_build_correct_flow(room, monkeypatch):
++    """sentence_build 答对：按正确顺序点击词芯片"""
++    recorded = []
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.record_exercise",
++        lambda *a, **k: recorded.append(a))
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.upsert_progress",
++        lambda *a, **k: None)
++
++    data = {
++        "type": "sentence_build",
++        "word": "gives",
++        "words": ["She", "never", "gives", "up"],
++        "correct_order": [0, 1, 2, 3],
++        "answer": "She never gives up",
++        "explanation": "主语 + 副词 + 动词短语",
++    }
++    card = _render(room, data)
++    # 按正确顺序点击
++    for idx in [0, 1, 2, 3]:
++        card._on_pool_click(idx)
++    # 构建区句子应等于答案
++    assert card._get_user_answer() == "She never gives up"
++    card._on_check_answer()
++    assert len(recorded) == 1
++    assert recorded[0][3] is True
++
++
++def test_sentence_build_wrong_flow(room, monkeypatch):
++    """sentence_build 答错：乱序点击"""
++    recorded = []
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.record_exercise",
++        lambda *a, **k: recorded.append(a))
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.upsert_progress",
++        lambda *a, **k: None)
++
++    data = {
++        "type": "sentence_build",
++        "word": "gives",
++        "words": ["She", "never", "gives", "up"],
++        "correct_order": [0, 1, 2, 3],
++        "answer": "She never gives up",
++        "explanation": "主语 + 副词 + 动词短语",
++    }
++    card = _render(room, data)
++    # 错误顺序
++    for idx in [3, 2, 1, 0]:
++        card._on_pool_click(idx)
++    assert card._get_user_answer() == "up gives never She"
++    card._on_check_answer()
++    assert len(recorded) == 1
++    assert recorded[0][3] is False
++
++
++def test_translate_assemble_correct_flow(room, monkeypatch):
++    """translate_assemble 答对"""
++    recorded = []
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.record_exercise",
++        lambda *a, **k: recorded.append(a))
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.upsert_progress",
++        lambda *a, **k: None)
++
++    data = {
++        "type": "translate_assemble",
++        "word": "study",
++        "prompt": "我正在学习英语",
++        "words": ["I", "am", "studying", "English", "now"],
++        "correct_order": [0, 1, 2, 3],
++        "answer": "I am studying English",
++        "explanation": "现在进行时",
++    }
++    card = _render(room, data)
++    for idx in [0, 1, 2, 3]:
++        card._on_pool_click(idx)
++    assert card._get_user_answer() == "I am studying English"
++    card._on_check_answer()
++    assert len(recorded) == 1
++    assert recorded[0][3] is True
++
++
++def test_story_correct_flow(room, monkeypatch):
++    """story 答对"""
++    recorded = []
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.record_exercise",
++        lambda *a, **k: recorded.append(a))
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.upsert_progress",
++        lambda *a, **k: None)
++
++    data = {
++        "type": "story",
++        "word": "decision",
++        "story_text": "Tom found a wallet.",
++        "choices": ["He kept it", "He took it to the police"],
++        "answer": "He took it to the police",
++        "explanation": "拾金不昧",
++    }
++    card = _render(room, data)
++    card._on_story_click("He took it to the police")
++    card._on_check_answer()
++    assert len(recorded) == 1
++    assert recorded[0][3] is True
++
++
++def test_match_full_pair_cycle_correct(room, monkeypatch):
++    """match 题型：完整左→右配对流程，全部配对正确应记录 correct=True。
++    此测试通过真实点击回调触发，能捕获闭包捕获循环变量的 bug。"""
++    recorded = []
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.record_exercise",
++        lambda *a, **k: recorded.append(a))
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.upsert_progress",
++        lambda *a, **k: None)
++
++    data = {
++        "type": "match",
++        "word": "greetings",
++        "pairs": {"Hello": "你好", "Goodbye": "再见"},
++        "answer": "你好 / 再见",
++        "explanation": "常见问候语",
++        "time_limit": 15,
++    }
++    card = _render(room, data)
++    # 停止计时器，避免测试中触发超时自动提交
++    card._match_timer.stop()
++
++    # 按正确配对依次点击左栏 + 右栏（右栏已打乱，按中文值查找按钮）
++    for en_word, zh_word in data["pairs"].items():
++        left_btn = card._left_buttons[en_word]
++        right_btn = card._right_buttons[zh_word]
++        card._on_left_click(en_word, left_btn)
++        card._on_right_click(zh_word, right_btn)
++
++    # 全部配对完成后自动提交
++    assert card._answered is True
++    assert len(recorded) == 1
++    assert recorded[0][2] == "match"
++    assert recorded[0][3] is True
++
++
++def test_match_timer_stops_on_manual_submit(room, monkeypatch):
++    """match 手动提交时应停止计时器，避免超时重复提交"""
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.record_exercise",
++        lambda *a, **k: None)
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.upsert_progress",
++        lambda *a, **k: None)
++
++    data = {
++        "type": "match",
++        "word": "greetings",
++        "pairs": {"Hello": "你好", "Goodbye": "再见"},
++        "answer": "你好 / 再见",
++        "explanation": "常见问候语",
++        "time_limit": 15,
++    }
++    card = _render(room, data)
++    # 计时器应在运行
++    assert card._match_timer.isActive()
++    # 手动提交（未配对完，直接点检查答案）
++    card._on_check_answer()
++    # 计时器应已停止
++    assert not card._match_timer.isActive()
++
++
++# ── resume_exercise 回传测试 ──
++def test_resume_exercise_called_after_correct_answer(room, monkeypatch):
++    """答对后应调用 ai_worker.resume_exercise"""
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.record_exercise",
++        lambda *a, **k: None)
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.upsert_progress",
++        lambda *a, **k: None)
++
++    worker = _FakeWorker()
++    room.ai_worker = worker
++
++    data = {
++        "type": "cloze",
++        "word": "test",
++        "prompt": "____",
++        "options": ["test", "a", "b", "c"],
++        "answer": "test",
++        "explanation": "test",
++    }
++    card = _render(room, data)
++    card._on_cloze_click("test", card._cloze_buttons[0])
++    card._on_check_answer()
++
++    assert len(worker.resumed) == 1
++    result = json.loads(worker.resumed[0])
++    assert result["correct"] is True
++    assert result["skipped"] is False
++    assert result["exercise_type"] == "cloze"
++
++
++def test_resume_exercise_called_after_wrong_answer(room, monkeypatch):
++    """答错后也应调用 ai_worker.resume_exercise"""
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.record_exercise",
++        lambda *a, **k: None)
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.upsert_progress",
++        lambda *a, **k: None)
++
++    worker = _FakeWorker()
++    room.ai_worker = worker
++
++    data = {
++        "type": "cloze",
++        "word": "test",
++        "prompt": "____",
++        "options": ["test", "a", "b", "c"],
++        "answer": "test",
++        "explanation": "test",
++    }
++    card = _render(room, data)
++    card._on_cloze_click("a", card._cloze_buttons[1])
++    card._on_check_answer()
++
++    assert len(worker.resumed) == 1
++    result = json.loads(worker.resumed[0])
++    assert result["correct"] is False
++    assert result["user_answer"] == "a"
++    assert result["correct_answer"] == "test"
++
++
++# ── 跳过测试 ──
++def test_skip_calls_resume_exercise_with_skipped(room, monkeypatch):
++    """跳过应调用 resume_exercise 且 skipped=True"""
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.record_exercise",
++        lambda *a, **k: None)
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.upsert_progress",
++        lambda *a, **k: None)
++
++    worker = _FakeWorker()
++    room.ai_worker = worker
++
++    data = {
++        "type": "cloze",
++        "word": "test",
++        "prompt": "____",
++        "options": ["test", "a", "b", "c"],
++        "answer": "test",
++        "explanation": "test",
++    }
++    card = _render(room, data)
++    card._on_skip()
++
++    assert len(worker.resumed) == 1
++    result = json.loads(worker.resumed[0])
++    assert result["skipped"] is True
++    assert result["correct"] is False
++    assert result["attempts"] == 0
++
++
++# ── 输入栏重新启用测试 ──
++def test_input_re_enabled_after_answer(room, monkeypatch):
++    """答完题后输入栏应重新启用"""
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.record_exercise",
++        lambda *a, **k: None)
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.upsert_progress",
++        lambda *a, **k: None)
++
++    data = {
++        "type": "cloze",
++        "word": "test",
++        "prompt": "____",
++        "options": ["test", "a", "b", "c"],
++        "answer": "test",
++        "explanation": "test",
++    }
++    _render(room, data)
++    assert room.input_edit.isEnabled() is False
++    card = room._current_card
++    card._on_cloze_click("test", card._cloze_buttons[0])
++    card._on_check_answer()
++    assert room.input_edit.isEnabled() is True
++    assert room.send_btn.isEnabled() is True
++
++
++def test_input_re_enabled_after_skip(room, monkeypatch):
++    """跳过后输入栏应重新启用"""
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.record_exercise",
++        lambda *a, **k: None)
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.upsert_progress",
++        lambda *a, **k: None)
++
++    data = {
++        "type": "cloze",
++        "word": "test",
++        "prompt": "____",
++        "options": ["test", "a", "b", "c"],
++        "answer": "test",
++        "explanation": "test",
++    }
++    _render(room, data)
++    assert room.input_edit.isEnabled() is False
++    card = room._current_card
++    card._on_skip()
++    assert room.input_edit.isEnabled() is True
++    assert room.send_btn.isEnabled() is True
++
++
++# ── 重复答题保护 ──
++def test_double_answer_is_ignored(room, monkeypatch):
++    """同一张卡片答两次：第二次应被忽略"""
++    recorded = []
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.record_exercise",
++        lambda *a, **k: recorded.append(a))
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.upsert_progress",
++        lambda *a, **k: None)
++
++    data = {
++        "type": "cloze",
++        "word": "test",
++        "prompt": "____",
++        "options": ["test", "a", "b", "c"],
++        "answer": "test",
++        "explanation": "test",
++    }
++    card = _render(room, data)
++    card._on_cloze_click("test", card._cloze_buttons[0])
++    card._on_check_answer()
++    card._on_check_answer()   # 第二次应被忽略
++    assert len(recorded) == 1
++
++
++# ── 反馈显示测试 ──
++def test_feedback_shown_after_correct(room, monkeypatch):
++    """答对后应显示绿色反馈"""
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.record_exercise",
++        lambda *a, **k: None)
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.upsert_progress",
++        lambda *a, **k: None)
++
++    data = {
++        "type": "cloze",
++        "word": "test",
++        "prompt": "____",
++        "options": ["test", "a", "b", "c"],
++        "answer": "test",
++        "explanation": "很棒！",
++    }
++    card = _render(room, data)
++    card._on_cloze_click("test", card._cloze_buttons[0])
++    card._on_check_answer()
++    # 卡片中应出现含"正确"的 QLabel
++    found = False
++    for i in range(card._layout.count()):
++        w = card._layout.itemAt(i).widget()
++        if isinstance(w, QLabel) and "正确" in w.text():
++            found = True
++            break
++    assert found, "答对后应显示绿色反馈"
++
++
++def test_feedback_shown_after_wrong(room, monkeypatch):
++    """答错后应显示红色反馈含正确答案"""
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.record_exercise",
++        lambda *a, **k: None)
++    monkeypatch.setattr(
++        "shadowtalk.ui.widgets.english_room.upsert_progress",
++        lambda *a, **k: None)
++
++    data = {
++        "type": "cloze",
++        "word": "test",
++        "prompt": "____",
++        "options": ["test", "a", "b", "c"],
++        "answer": "test",
++        "explanation": "加油！",
++    }
++    card = _render(room, data)
++    card._on_cloze_click("a", card._cloze_buttons[1])
++    card._on_check_answer()
++    found = False
++    for i in range(card._layout.count()):
++        w = card._layout.itemAt(i).widget()
++        if isinstance(w, QLabel) and "错误" in w.text() and "test" in w.text():
++            found = True
++            break
++    assert found, "答错后应显示红色反馈含正确答案"
++
++
++# ── 场景 prompt 注入测试 ──
++
++def test_current_scene_prompt_uses_build_scene_prompt(room, monkeypatch):
++    """EnglishRoomWindow._current_scene_prompt 应调用 build_scene_prompt 并注入词库范围"""
++    called = []
++    monkeypatch.setattr(
++        "shadowtalk.core.english_exercise.build_scene_prompt",
++        lambda fid, wr: (called.append((fid, wr)), f"[{wr}] scene")[1])
++    prompt = room._current_scene_prompt()
++    assert called == [(room.friend_id, room._word_range)]
++    assert f"[{room._word_range}] scene" in prompt
+diff --git a/aiworkspace18/tests/test_english_word_range_dialog.py b/aiworkspace18/tests/test_english_word_range_dialog.py
+new file mode 100644
+index 0000000..14d02df
+--- /dev/null
++++ b/aiworkspace18/tests/test_english_word_range_dialog.py
+@@ -0,0 +1,70 @@
++"""英语教室词库选择对话框测试：默认选中、有进度时继续、词库常量"""
++import sys
++
++import pytest
++from PySide6.QtWidgets import QApplication
++
++app = QApplication.instance() or QApplication(sys.argv)
++
++from shadowtalk.ui.widgets.english_word_range_dialog import (
++    EnglishWordRangeDialog,
++    WORD_RANGES,
++)
++
++
++def test_dialog_default_selection():
++    """默认选中 CET-4 和 restart（无进度时）"""
++    dlg = EnglishWordRangeDialog()
++    assert dlg.get_selected_range() == ("CET-4", "restart")
++
++
++def test_dialog_with_progress():
++    """有进度时默认选中 continue"""
++    dlg = EnglishWordRangeDialog(has_progress=True)
++    assert dlg.get_selected_range() == ("CET-4", "continue")
++
++
++def test_dialog_all_ranges():
++    """所有词库范围应可获取"""
++    dlg = EnglishWordRangeDialog()
++    # 验证 WORD_RANGES 常量存在且包含 4 个词库
++    assert len(WORD_RANGES) == 4
++    keys = [k for k, _ in WORD_RANGES]
++    assert "CET-4" in keys
++    assert "CET-6" in keys
++    assert "IELTS" in keys
++    assert "TOEFL" in keys
++
++
++def test_dialog_continue_disabled_without_progress():
++    """无进度时「从上次进度继续」应禁用"""
++    dlg = EnglishWordRangeDialog(has_progress=False)
++    assert dlg._continue_rb.isEnabled() is False
++    assert dlg._restart_rb.isChecked() is True
++
++
++def test_dialog_continue_enabled_with_progress():
++    """有进度时「从上次进度继续」应启用且默认选中"""
++    dlg = EnglishWordRangeDialog(has_progress=True)
++    assert dlg._continue_rb.isEnabled() is True
++    assert dlg._continue_rb.isChecked() is True
++
++
++def test_dialog_select_range_and_mode():
++    """切换词库与模式后 get_selected_range 应反映选择"""
++    dlg = EnglishWordRangeDialog(has_progress=True)
++    # 选中 TOEFL
++    for rb in dlg._range_group.buttons():
++        if rb.text() == "TOEFL":
++            rb.setChecked(True)
++            break
++    # 选中快速测试
++    dlg._test_rb.setChecked(True)
++    assert dlg.get_selected_range() == ("TOEFL", "test")
++
++
++def test_dialog_restart_mode():
++    """选中 restart 模式应返回 restart"""
++    dlg = EnglishWordRangeDialog(has_progress=True)
++    dlg._restart_rb.setChecked(True)
++    assert dlg.get_selected_range() == ("CET-4", "restart")
+diff --git a/aiworkspace19/VideoWorkbench.spec b/aiworkspace19/VideoWorkbench.spec
+index 9f8c704..b10737b 100644
+--- a/aiworkspace19/VideoWorkbench.spec
++++ b/aiworkspace19/VideoWorkbench.spec
+@@ -55,21 +55,21 @@ pyz = PYZ(a.pure, a.zipped_data)
+ exe = EXE(
+     pyz,
+     a.scripts,
+     [],
+     exclude_binaries=True,
+     name="VideoWorkbench",
+     debug=False,
+     bootloader_ignore_signals=False,
+     strip=False,
+     upx=False,
+-    console=False,          # windowed app (no console window)
++    console=False,
+     disable_windowed_traceback=False,
+     icon=None,
+ )
+ 
+ coll = COLLECT(
+     exe,
+     a.binaries,
+     a.zipfiles,
+     a.datas,
+     strip=False,
+diff --git a/aiworkspace19/frontend/js/timeline.js b/aiworkspace19/frontend/js/timeline.js
+index f9b6554..d77f765 100644
+--- a/aiworkspace19/frontend/js/timeline.js
++++ b/aiworkspace19/frontend/js/timeline.js
+@@ -48,20 +48,26 @@ export function initTimeline() {
+     canvas.width = wrap.clientWidth * devicePixelRatio;
+     canvas.height = wrap.clientHeight * devicePixelRatio;
+     ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+     drawTimeline();
+   };
+   new ResizeObserver(resize).observe(wrap);
+ 
+   canvas.addEventListener('pointerdown', onDown);
+   canvas.addEventListener('pointermove', onMove);
+   canvas.addEventListener('pointerup', onUp);
++  canvas.addEventListener('pointermove', (ev) => {
++    const h = hitTest(ev);
++    canvas.style.cursor = (h.zone === 'vo' || h.zone === 'bgm') ? 'pointer'
++      : (h.zone === 'left' || h.zone === 'right') ? 'ew-resize'
++      : (h.zone === 'body') ? 'grab' : 'default';
++  });
+   canvas.addEventListener('wheel', onWheel, { passive: false });
+   canvas.addEventListener('dblclick', onDblClick);
+   // drop from asset pool
+   canvas.addEventListener('dragover', (ev) => ev.preventDefault());
+   canvas.addEventListener('drop', async (ev) => {
+     ev.preventDefault();
+     const id = ev.dataTransfer.getData('text/asset-id');
+     if (id) applyOp({ op: 'add', assetId: id });
+   });
+ }
+@@ -73,20 +79,30 @@ function hitTest(ev) {
+   if (y < RULER + TRACK + PAD) {
+     for (const it of clipLayout()) {
+       const x0 = timeToX(it.start), x1 = timeToX(it.end);
+       if (x >= x0 - 6 && x <= x1 + 6) {
+         if (Math.abs(x - x0) <= 6) return { zone: 'left', it, x, y };
+         if (Math.abs(x - x1) <= 6) return { zone: 'right', it, x, y };
+         if (x >= x0 && x <= x1) return { zone: 'body', it, x, y };
+       }
+     }
+   }
++  // VO bar area (just below the track) — click selects the clip for editing
++  const voY = RULER + TRACK + PAD;
++  if (y >= voY && y < voY + VO) {
++    for (const it of clipLayout()) {
++      const x0 = timeToX(it.start), x1 = timeToX(it.end);
++      if (x >= x0 && x <= x1) {
++        return { zone: 'vo', it, x, y };
++      }
++    }
++  }
+   // BGM track area (below VO, at bottom)
+   const bgmY = RULER + TRACK + PAD + VO + 4;
+   if (state.project && state.project.settings.bgm.file && y >= bgmY && y <= bgmY + BGM) {
+     return { zone: 'bgm', x, y };
+   }
+   return { zone: 'empty', x, y };
+ }
+ 
+ function onDown(ev) {
+   pausePreview();
+@@ -99,20 +115,28 @@ function onDown(ev) {
+     seekTo(state.playhead);
+     drag = { kind: 'playhead' };
+     return;
+   }
+   if (h.zone === 'bgm') {
+     state.selectedClipId = null;
+     state.selectedBgm = true;
+     renderAll();
+     return;
+   }
++  if (h.zone === 'vo') {
++    // clicking the VO bar selects the clip and switches to the VO tab
++    state.selectedClipId = h.it.clip.id;
++    state.selectedBgm = false;
++    renderAll();
++    document.querySelector('[data-tab="voPanel"]')?.click();
++    return;
++  }
+   state.selectedClipId = h.it.clip.id;
+   state.selectedBgm = false;
+   renderAll();
+   if (h.zone === 'left' || h.zone === 'right') {
+     drag = { kind: 'trim', zone: h.zone, it: h.it,
+              asset: state.project.assets.find((a) => a.id === h.it.clip.assetId),
+              startX: h.x };
+   } else if (h.zone === 'body') {
+     drag = { kind: 'move', it: h.it, startX: h.x, index: idxOf(h.it.clip.id) };
+   }
+diff --git a/aiworkspace19/main.py b/aiworkspace19/main.py
+index 0651a3b..b9c521f 100644
+--- a/aiworkspace19/main.py
++++ b/aiworkspace19/main.py
+@@ -5,23 +5,31 @@ import os
+ import shutil
+ import socket
+ import sys
+ import threading
+ import time
+ import urllib.request
+ from pathlib import Path
+ 
+ 
+ def _user_data_folder() -> str:
+-    """Fixed WebView2 user-data folder (avoids temp-dir cleanup races)."""
++    """Per-session WebView2 storage. Pre-cleans to avoid locked-file cleanup crashes."""
+     base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+-    udf = base / "VideoWorkbench" / "WebView2Data"
++    # Clean up any previous session folders (they may be locked by crashed processes)
++    vb_root = base / "VideoWorkbench"
++    if vb_root.exists():
++        for old in vb_root.glob("session-*"):
++            try:
++                shutil.rmtree(old, ignore_errors=True)
++            except Exception:
++                pass
++    udf = vb_root / f"session-{os.getpid()}"
+     udf.mkdir(parents=True, exist_ok=True)
+     return str(udf)
+ 
+ 
+ def free_port() -> int:
+     s = socket.socket()
+     s.bind(("127.0.0.1", 0))
+     port = s.getsockname()[1]
+     s.close()
+     return port
+@@ -59,21 +67,24 @@ def main() -> int:
+     if "--check" in sys.argv:
+         if not wait_up(port):
+             print("SERVER-FAIL", flush=True)
+             return 1
+         print(f"APP-OK http://127.0.0.1:{port}", flush=True)
+         return 0
+     if not wait_up(port):
+         print("server failed to start", flush=True)
+         return 1
+     import webview
+-    # Use a fixed user-data folder to avoid temp-dir cleanup races
+     udf = _user_data_folder()
+-    webview.create_window("AI 视频成片工作台",
+-                          f"http://127.0.0.1:{port}/",
+-                          width=1440, height=920, min_size=(1100, 700))
+-    webview.start(gui="edgechromium", storage_path=udf)
++    try:
++        webview.create_window("AI 视频成片工作台",
++                              f"http://127.0.0.1:{port}/",
++                              width=1440, height=920, min_size=(1100, 700))
++        webview.start(gui="edgechromium", storage_path=udf)
++    except Exception as e:
++        print(f"WEBVIEW-ERROR: {type(e).__name__}: {e}", flush=True)
++        raise
+     return 0
+ 
+ 
+ if __name__ == "__main__":
+     raise SystemExit(main())

@@ -1,0 +1,253 @@
+diff --git a/aiworkspace18/shadowtalk/ui/widgets/english_room.py b/aiworkspace18/shadowtalk/ui/widgets/english_room.py
+new file mode 100644
+index 0000000..6ee27dd
+--- /dev/null
++++ b/aiworkspace18/shadowtalk/ui/widgets/english_room.py
+@@ -0,0 +1,113 @@
++"""沉浸式英语教室：左聊右练，AI 驱动练习卡片。
++
++复用 RoomWindow 骨架：左侧窄聊天区（280px）+ 右侧练习卡片面板。
++AI 通过 present_exercise 工具在右侧出题，用户答题后结果回传 AI。
++设计文档：docs/superpowers/specs/2026-08-18-english-learning-room-design.md
++"""
++import json
++import logging
++import time
++
++from PySide6.QtCore import Qt, Signal
++from PySide6.QtWidgets import (
++    QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame, QScrollArea,
++    QWidget, QButtonGroup, QRadioButton, QLineEdit,
++)
++
++from shadowtalk.core.english_exercise import (
++    record_exercise, upsert_progress, get_stats,
++)
++from shadowtalk.ui.widgets.room_window import RoomBubble, RoomWindow
++
++logger = logging.getLogger(__name__)
++
++
++class ExerciseCard(QFrame):
++    """练习卡片基类：题型渲染 + 答题回传"""
++
++    answered = Signal(str, dict)  # (tool_call_id, result_dict)
++
++    def __init__(self, exercise_data: dict, tool_call_id: str = "", parent=None):
++        super().__init__(parent)
++        self._data = exercise_data
++        self._tool_call_id = tool_call_id
++        self._start_time = time.time()
++        self._attempts = 0
++        self._answered = False
++        self._layout = QVBoxLayout(self)
++        self._layout.setContentsMargins(16, 16, 16, 16)
++        self._layout.setSpacing(8)
++        self.setStyleSheet("""
++            QFrame { background-color: rgba(255,255,255,235);
++                     border-radius: 16px; }
++            QLabel { color: #1F2430; background: transparent; }
++        """)
++
++
++class EnglishRoomWindow(RoomWindow):
++    """英语教室：左聊右练"""
++
++    def __init__(self, friend_id: int, word_range: str = "CET-4",
++                 start_mode: str = "restart", parent=None):
++        self._word_range = word_range
++        self._start_mode = start_mode
++        self._current_card = None
++        self._current_tool_call_id = ""
++        super().__init__(friend_id, "english", parent=parent)
++
++    def _build_ui(self):
++        super()._build_ui()
++        # 左侧聊天区固定 280px（和阅读室右边聊天区同宽）
++        self.chat_scroll.setFixedWidth(280)
++        # 右侧练习面板
++        self.exercise_panel = QFrame()
++        self.exercise_panel.setStyleSheet("background: transparent;")
++        self._exercise_layout = QVBoxLayout(self.exercise_panel)
++        self._exercise_layout.setContentsMargins(16, 16, 16, 16)
++        self._exercise_layout.addStretch(1)
++        # 插入到内容区右侧
++        self._content_host.addWidget(self.exercise_panel, 1)
++        # 统计标签（放在顶栏标题后）
++        self._stats_label = QLabel("")
++        self._stats_label.setStyleSheet(
++            "color: rgba(245,239,230,210); font-size: 12px; background: transparent;")
++        self._update_stats()
++
++    def _update_stats(self):
++        """刷新顶部统计"""
++        stats = get_stats(self.friend_id)
++        self._stats_label.setText(
++            f"🔥 连胜 {stats['streak']}  |  "
++            f"今日 {stats['today_count']} 题  |  "
++            f"正确率 {stats['accuracy']}%")
++
++    def _on_exercise_requested(self, code: str, word_range: str, reason: str):
++        """AIWorker 发出 exercise_requested 信号时渲染卡片"""
++        self.input_edit.setEnabled(False)
++        self.send_btn.setEnabled(False)
++        try:
++            data = json.loads(code)
++        except (json.JSONDecodeError, TypeError):
++            logger.error("解析练习数据失败: %s", code[:100])
++            return
++        self._render_exercise_card(data)
++
++    def _render_exercise_card(self, data: dict):
++        """根据题型渲染对应卡片（Task 7 实现具体渲染）"""
++        # 清除旧卡片
++        if self._current_card is not None:
++            self._exercise_layout.removeWidget(self._current_card)
++            self._current_card.deleteLater()
++            self._current_card = None
++        # Task 7 will implement the actual card rendering
++        placeholder = QLabel("练习卡片加载中…")
++        placeholder.setStyleSheet("font-size: 14px; color: #7A7A7A;")
++        self._exercise_layout.insertWidget(
++            self._exercise_layout.count() - 1, placeholder)
++        self._current_card = placeholder
++
++    def closeEvent(self, event):
++        if self._current_card is not None:
++            self._current_card.deleteLater()
++            self._current_card = None
++        super().closeEvent(event)
+diff --git a/aiworkspace18/tests/test_english_room.py b/aiworkspace18/tests/test_english_room.py
+new file mode 100644
+index 0000000..bf9b69a
+--- /dev/null
++++ b/aiworkspace18/tests/test_english_room.py
+@@ -0,0 +1,128 @@
++"""沉浸式英语教室 UI 测试：骨架与布局"""
++import sys
++
++import pytest
++from PySide6.QtWidgets import QApplication, QLabel
++
++from shadowtalk.data.database import Database
++from shadowtalk.data.repositories import FriendRepository
++
++Database.get_connection()   # 触发 rooms/迁移播种
++
++app = QApplication.instance() or QApplication(sys.argv)
++
++
++def _make_friend(name="小学"):
++    return FriendRepository.insert(name, "", "你是小学")
++
++
++class _FakeWorker:
++    """伪 AIWorker：提供 window 所需的信号接口"""
++    def __init__(self, *a, **k):
++        self.messages = k.get("messages", a[3] if len(a) > 3 else [])
++
++    def cancel(self):
++        pass
++
++    def isRunning(self):
++        return False
++
++    def wait(self, ms):
++        return True
++
++    def start(self):
++        pass
++
++
++@pytest.fixture()
++def room(monkeypatch):
++    from shadowtalk.ui.widgets import room_window as rw
++    from shadowtalk.ui.widgets.english_room import EnglishRoomWindow
++    fid = _make_friend()
++    monkeypatch.setattr(rw, "AIWorker", lambda *a, **k: _FakeWorker(*a, **k))
++    monkeypatch.setattr(rw, "AIClient", lambda *a, **k: object())
++    win = EnglishRoomWindow(fid)
++    yield win
++    win.close()
++
++
++def test_english_room_window_class():
++    """EnglishRoomWindow 应继承 RoomWindow"""
++    from shadowtalk.ui.widgets.english_room import EnglishRoomWindow
++    from shadowtalk.ui.widgets.room_window import RoomWindow
++    assert issubclass(EnglishRoomWindow, RoomWindow)
++
++
++def test_english_room_subclass_instance(room):
++    """实例化后是 RoomWindow 的子类实例"""
++    from shadowtalk.ui.widgets.room_window import RoomWindow
++    assert isinstance(room, RoomWindow)
++
++
++def test_chat_scroll_fixed_width(room):
++    """左侧聊天区固定 280px"""
++    assert room.chat_scroll.width() == 280
++
++
++def test_exercise_panel_exists(room):
++    """右侧练习面板已创建"""
++    assert room.exercise_panel is not None
++    # 练习面板是内容区宿主的一个子部件
++    found = False
++    for i in range(room._content_host.count()):
++        if room._content_host.itemAt(i).widget() is room.exercise_panel:
++            found = True
++            break
++    assert found, "exercise_panel 应在 _content_host 中"
++
++
++def test_stats_label_exists(room):
++    """顶部统计标签已创建"""
++    assert room._stats_label is not None
++    # 统计标签应包含连胜/今日/正确率三栏
++    text = room._stats_label.text()
++    assert "连胜" in text
++    assert "今日" in text
++    assert "正确率" in text
++
++
++def test_exercise_requested_disables_input(room):
++    """AI 出题时应禁用输入栏"""
++    room.input_edit.setEnabled(True)
++    room.send_btn.setEnabled(True)
++    room._on_exercise_requested(
++        '{"type":"cloze","word":"test","answer":"test","explanation":"test"}',
++        "CET-4", "出题: 测试")
++    assert room.input_edit.isEnabled() is False
++    assert room.send_btn.isEnabled() is False
++
++
++def test_exercise_requested_renders_placeholder(room):
++    """AI 出题时渲染占位卡片（Task 7 替换为真实渲染）"""
++    room._on_exercise_requested(
++        '{"type":"cloze","word":"test","answer":"test","explanation":"test"}',
++        "CET-4", "出题: 测试")
++    assert room._current_card is not None
++    # 占位卡片本身是 QLabel（含"加载中"文字）
++    from PySide6.QtWidgets import QLabel
++    assert isinstance(room._current_card, QLabel)
++    assert "加载" in room._current_card.text()
++
++
++def test_exercise_requested_invalid_json_no_crash(room):
++    """无效 JSON 不应崩溃，仅记日志"""
++    # 不应抛异常
++    room._on_exercise_requested("not-json", "CET-4", "出题: 测试")
++    # 不应渲染卡片
++    # （无效 JSON 时 _render_exercise_card 未被调用，_current_card 保持原样）
++
++
++def test_close_event_cleans_up_card(room):
++    """关闭窗口应清理当前卡片"""
++    room._on_exercise_requested(
++        '{"type":"cloze","word":"test","answer":"test","explanation":"test"}',
++        "CET-4", "出题: 测试")
++    assert room._current_card is not None
++    room.close()
++    # closeEvent 将 _current_card 置 None
++    assert room._current_card is None

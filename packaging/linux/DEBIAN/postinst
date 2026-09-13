@@ -1,0 +1,8 @@
+#!/bin/sh
+# 安装后：确保可执行位 + 刷新桌面菜单缓存
+set -e
+chmod 755 /opt/shadowtalk/ShadowTalk
+[ -x /opt/shadowtalk/_internal/runtime/python3 ] && \
+    chmod 755 /opt/shadowtalk/_internal/runtime/python3
+update-desktop-database -q /usr/share/applications || true
+exit 0
