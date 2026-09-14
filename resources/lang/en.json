@@ -267,5 +267,9 @@
   " 次": "",
   "暂无联系人\n\n收发邮件后会自动从邮件中提取，\n也可以点右上角「➕ 新建」手动添加": "No contacts yet\n\nContacts auto-extract from emails,\nor tap \"➕ New\" to add manually",
   "删除联系人": "Delete Contact",
-  "确定删除联系人吗？\n\n": "Delete this contact?\n\n"
+  "确定删除联系人吗？\n\n": "Delete this contact?\n\n",
+  "使用声明": "Usage Statement",
+  "同意并使用": "Agree and Continue",
+  "退出": "Exit",
+  "我知道了": "Got It"
 }
