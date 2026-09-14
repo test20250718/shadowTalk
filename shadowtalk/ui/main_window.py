@@ -202,6 +202,9 @@ class MainWindow(QMainWindow):
         settings_action.triggered.connect(self._on_open_settings)
 
         help_menu = menu_bar.addMenu(tr("帮助"))
+        # 使用声明放在帮助文档上面：首启同意过后无处可看，这里随时重看
+        statement_action = help_menu.addAction(tr("使用声明"))
+        statement_action.triggered.connect(self._on_open_usage_statement)
         help_doc_action = help_menu.addAction(tr("帮助文档"))
         help_doc_action.triggered.connect(self._on_open_help_doc)
         about_action = help_menu.addAction(tr("关于 影聊"))
@@ -210,6 +213,11 @@ class MainWindow(QMainWindow):
     def _on_open_about(self):
         from shadowtalk.ui.widgets.about_dialog import AboutDialog
         AboutDialog(self).exec()
+
+    def _on_open_usage_statement(self):
+        """帮助菜单重看使用声明（查看模式：无 同意/退出 按钮，按当前语言显示）"""
+        from shadowtalk.ui.widgets.eula_dialog import EulaDialog
+        EulaDialog(self, view_only=True).exec()
 
     def _on_open_help_doc(self):
         """打开用户手册 PDF（系统默认 PDF 阅读器）。

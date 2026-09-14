@@ -61,6 +61,30 @@ def test_check_eula_decline_blocks(monkeypatch):
         Settings.set("eula_accepted", "")
 
 
+def test_view_only_mode_shows_single_close_button():
+    """帮助菜单查看模式：无 同意/退出 按钮，正文仍含免责关键文案"""
+    dlg = EulaDialog(view_only=True)
+    assert not hasattr(dlg, "_accept_btn")
+    assert not hasattr(dlg, "_decline_btn")
+    assert "仅供参考" in dlg.to_plain_text()
+
+
+def test_dialog_text_follows_language():
+    """声明正文/标题按语言切换：en → 英文，否则中文"""
+    from shadowtalk.config import i18n
+    saved_lang, saved_translations = i18n._lang, i18n._translations
+    try:
+        i18n._translations = {"en": {"使用声明": "Usage Statement"}, "zh": {}}
+        i18n._lang = "zh"
+        assert "仅供参考" in EulaDialog().to_plain_text()
+        i18n._lang = "en"
+        dlg = EulaDialog()
+        assert "reference only" in dlg.to_plain_text()
+        assert dlg.windowTitle() == "Usage Statement"
+    finally:
+        i18n._lang, i18n._translations = saved_lang, saved_translations
+
+
 def test_dialog_label_color_rule_dark():
     """深色模式下声明文字有显式颜色规则（QSS color 不向子控件传播）"""
     from shadowtalk.ui import theme
